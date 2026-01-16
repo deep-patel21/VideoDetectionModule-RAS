@@ -1,2 +1,3 @@
 # VideoDetectionModule-RAS
-TBD
+Installation:
+pip install -r requirements.txt
