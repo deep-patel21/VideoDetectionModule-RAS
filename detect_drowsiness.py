@@ -14,6 +14,7 @@ LOG_OPTIONS     = ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
 RISK_SEVERITIES = ["MILD", "MODERATE", "SEVERE"]
 
 CAMERA_INDEX    = 0
+TARGET_FPS      = 24
 
 
 def setup_logger(log_level):
@@ -41,6 +42,7 @@ def setup_argument_parser():
     parser = argparse.ArgumentParser()
 
     parser.add_argument("-ll", "--log_level", help="Logging level to use with logging library", default="INFO", choices=LOG_OPTIONS)
+    parser.add_argument("-v",  "--target_fps", help="Target FPS for video processing", default=TARGET_FPS, type=int)
 
     return parser.parse_args()
 
@@ -88,6 +90,9 @@ def main():
     setup_logger(args.log_level)
 
     video_stream = cv2.VideoCapture(CAMERA_INDEX)
+    
+    target_fps = args.target_fps
+    frame_duration = 1 / target_fps
 
     # The program should not continue if the webcam failed to initialize
     if not video_stream.isOpened():
@@ -95,9 +100,10 @@ def main():
         exit()
 
     video_width, video_height = get_video_dimensions(video_stream)
-    prev_frame_time = time.time()
 
     while(True):
+        start_time = time.time()
+
         # Continuosly capture a frame with success/failure return value
         ret, frame = video_stream.read()
 
@@ -105,16 +111,14 @@ def main():
             logging.warning("Encountered frame drop. Exiting video stream.")
             break
 
-        # Compute real-time fps of the video stream
-        new_frame_time  = time.time()
-        time_difference = new_frame_time - prev_frame_time
-        
-        if time_difference > 0:
-            fps = 1 / time_difference
-        else:
-            fps = 0
+        # Synchronize loop speed with target fps, providing software capped frame rate
+        processing_time = time.time() - start_time
 
-        prev_frame_time = new_frame_time
+        if processing_time < frame_duration:
+            time.sleep(frame_duration - processing_time)
+
+        # Compute real-time fps of the video stream
+        fps = 1.0 / (time.time() - start_time)
 
         # Add text stating resolution and frames per second of video capture
         annotate_video(frame, video_width, video_height, fps)
