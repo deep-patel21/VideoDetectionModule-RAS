@@ -17,7 +17,11 @@ CAMERA_INDEX    = 0
 
 
 def setup_logger(log_level):
-    """Setup logger with the specified log level."""
+    """
+    Setup logger with the specified log level.
+
+    :param log_level: The logging level to use in logger configuration
+    """
 
     numeric_level = getattr(logging, log_level.upper(), None)
 
@@ -30,7 +34,9 @@ def setup_logger(log_level):
 
 
 def setup_argument_parser():
-    """Setup argument parser for command line arguments."""
+    """
+    Setup argument parser for command line arguments.
+    """
 
     parser = argparse.ArgumentParser()
 
@@ -40,8 +46,41 @@ def setup_argument_parser():
 
 
 def compute_eye_aspect_ratio():
-    """Compute the eye aspect ratio using Euclidean distances."""
+    """
+    Compute the eye aspect ratio using Euclidean distances.
+    """
+
     pass
+
+
+def get_video_dimensions(video_stream):
+    """
+    Return the width and height of the video stream
+    
+    :param video_stream: instance of cv2 VideoCapture
+    """
+
+    width = int(video_stream.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(video_stream.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+    return width, height
+
+
+def annotate_video(frame, video_width, video_height, fps):
+    """
+    Annotate the video stream with resolution and frame rate information.
+
+    :param video_stream: instance of cv2 VideoCapture
+    :param video_width : width of the video stream
+    :param video_height: height of the video stream
+    :param frame       : captured frame
+    """
+
+    resolution_str = f"Resolution: {video_width}x{video_height}"
+    fps_str = f"FPS: {int(fps)}"
+    
+    cv2.putText(frame, resolution_str, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+    cv2.putText(frame, fps_str, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
 
 def main():
@@ -51,9 +90,12 @@ def main():
     video_stream = cv2.VideoCapture(CAMERA_INDEX)
 
     # The program should not continue if the webcam failed to initialize
-    if not video_stream:
+    if not video_stream.isOpened():
         logging.error("Camera failed to operate")
         exit()
+
+    video_width, video_height = get_video_dimensions(video_stream)
+    prev_frame_time = time.time()
 
     while(True):
         # Continuosly capture a frame with success/failure return value
@@ -63,8 +105,22 @@ def main():
             logging.warning("Encountered frame drop. Exiting video stream.")
             break
 
+        # Compute real-time fps of the video stream
+        new_frame_time  = time.time()
+        time_difference = new_frame_time - prev_frame_time
+        
+        if time_difference > 0:
+            fps = 1 / time_difference
+        else:
+            fps = 0
+
+        prev_frame_time = new_frame_time
+
+        # Add text stating resolution and frames per second of video capture
+        annotate_video(frame, video_width, video_height, fps)
+
         frame_greyscale = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        cv2.imshow('Frame', frame_greyscale)
+        cv2.imshow('VideoDetectionModule - RAS', frame_greyscale)
         
         if cv2.waitKey(1) == ord('q'):
             break
