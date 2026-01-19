@@ -72,17 +72,17 @@ def annotate_video(frame, video_width, video_height, fps):
     """
     Annotate the video stream with resolution and frame rate information.
 
-    :param video_stream: instance of cv2 VideoCapture
+    :param frame       : captured frame
     :param video_width : width of the video stream
     :param video_height: height of the video stream
-    :param frame       : captured frame
+    :param fps         : frame rate of video stream
     """
 
     resolution_str = f"Resolution: {video_width}x{video_height}"
-    fps_str = f"FPS: {int(fps)}"
+    fps_str        = f"FPS: {int(fps)}"
     
     cv2.putText(frame, resolution_str, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-    cv2.putText(frame, fps_str, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+    cv2.putText(frame, fps_str,        (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
 
 def main():
