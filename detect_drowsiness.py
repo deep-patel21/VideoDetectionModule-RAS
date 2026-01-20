@@ -11,13 +11,18 @@ from imutils import face_utils
 from imutils.video import VideoStream
 from scipy.spatial import distance
 
+
 LANDMARK_PREDICTION_MODEL = "models/shape_predictor_68_face_landmarks.dat"
+
+(LEFT_START, LEFT_END)   = face_utils.FACIAL_LANDMARKS_68_IDXS["left_eye"]
+(RIGHT_START, RIGHT_END) = face_utils.FACIAL_LANDMARKS_68_IDXS["right_eye"]
 
 LOG_OPTIONS     = ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
 RISK_SEVERITIES = ["MILD", "MODERATE", "SEVERE"]
 
 CAMERA_INDEX    = 0
 TARGET_FPS      = 24
+EAR_THRESHOLD   = 0.15
 
 
 def setup_logger(log_level):
@@ -44,10 +49,11 @@ def setup_argument_parser():
 
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("-ll", "--log_level",   help="Logging level to use with logging library", default="INFO", choices=LOG_OPTIONS)
-    parser.add_argument("-v",  "--target_fps",  help="Target FPS for video processing", default=TARGET_FPS, type=int)
-    parser.add_argument("-m",  "--dlib_model",  help="Path to the Dlib landmark prediction model", default=LANDMARK_PREDICTION_MODEL, type=str)
-    parser.add_argument("-s",  "--show_simple", help="Show landmarks on a black canvas instead of raw video", action="store_true")
+    parser.add_argument("-ll", "--log_level",     help="Logging level to use with logging library", default="INFO", choices=LOG_OPTIONS)
+    parser.add_argument("-v",  "--target_fps",    help="Target FPS for video processing", default=TARGET_FPS, type=int)
+    parser.add_argument("-m",  "--dlib_model",    help="Path to the Dlib landmark prediction model", default=LANDMARK_PREDICTION_MODEL, type=str)
+    parser.add_argument("-s",  "--show_simple",   help="Show landmarks on a black canvas instead of raw video", action="store_true")
+    parser.add_argument("-e",  "--ear_threshold", help="Eye aspect ratio threshold for detecting drowsiness", default=EAR_THRESHOLD, type=float)
 
     return parser.parse_args()
 
@@ -69,12 +75,38 @@ def setup_facial_recognition(dlib_model_path):
     return detector, predictor
 
 
-def compute_eye_aspect_ratio():
+def compute_eye_aspect_ratio(eye):
     """
     Compute the eye aspect ratio using Euclidean distances.
+
+    :param eye: singular eye landmark set
     """
 
-    pass
+    v1 = distance.euclidean(eye[1], eye[5])
+    v2 = distance.euclidean(eye[2], eye[4])
+    v3 = distance.euclidean(eye[0], eye[3])
+
+    return (v1 + v2) / (2.0 * v3)
+
+
+def eye_aspect_ratio_handler(shape):
+    """
+    Compute the eye aspect ratio using Euclidean distances.
+
+    :param shape: facial landmarks extracted from the face
+    """
+
+    # Determine eye specific landmark points
+    left_eye  = shape[LEFT_START:LEFT_END]
+    right_eye = shape[RIGHT_START:RIGHT_END]
+
+    left_eye_ar  = compute_eye_aspect_ratio(left_eye)
+    right_eye_ar = compute_eye_aspect_ratio(right_eye)
+
+    # Calculate the average eye aspect ratio to improve stability
+    averaged_ar = (left_eye_ar + right_eye_ar) / 2.0
+
+    return averaged_ar
 
 
 def get_video_dimensions(video_stream):
@@ -90,21 +122,33 @@ def get_video_dimensions(video_stream):
     return width, height
 
 
-def annotate_video(frame, video_width, video_height, fps):
+def annotate_video(frame, video_width, video_height, fps, eye_ar, ear_threshold):
     """
     Annotate the video stream with resolution and frame rate information.
 
-    :param frame       : captured frame
-    :param video_width : width of the video stream
-    :param video_height: height of the video stream
-    :param fps         : frame rate of video stream
+    :param frame        : captured frame
+    :param video_width  : width of the video stream
+    :param video_height : height of the video stream
+    :param fps          : frame rate of video stream
+    :param eye_ar       : eye aspect ratio
     """
 
     resolution_str = f"Resolution: {video_width}x{video_height}"
     fps_str        = f"FPS: {int(fps)}"
+    eye_ar_str     = f"Eye Aspect Ratio: {eye_ar:.2f}"
 
-    cv2.putText(frame, resolution_str, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 2)
-    cv2.putText(frame, fps_str,        (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 2)
+    if eye_ar < ear_threshold:
+        eye_status_str = "EYES CLOSED"
+        eye_status_color = (0, 0, 255)
+    else:
+        eye_status_str = "EYES OPEN"
+        eye_status_color = (0, 255, 0)  
+
+    # Draw annotation elements
+    cv2.putText(frame, resolution_str,                (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200),  2)
+    cv2.putText(frame, fps_str,                       (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200),  2)
+    cv2.putText(frame, eye_ar_str,                    (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200),  2)
+    cv2.putText(frame, eye_status_str, (video_width - 250, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, eye_status_color, 2)
 
 
 def main():
@@ -130,6 +174,9 @@ def main():
         # Continuosly capture a frame with success/failure return value
         ret, raw_frame = video_stream.read()
         frame = cv2.flip(raw_frame, 1)
+        
+        # Eye aspect ratio is initally set to 0
+        eye_ar = 0
 
         if not ret:
             logging.warning("Encountered frame drop. Exiting video stream.")
@@ -154,6 +201,8 @@ def main():
             shape = predictor(frame_greyscale, face)
             shape = face_utils.shape_to_np(shape)
 
+            eye_ar = eye_aspect_ratio_handler(shape)
+
             # Draw a face mask using the 68-landmarks extracted with dlib
             for (x, y) in shape:
                 cv2.circle(display_frame, (x, y), 1, (255, 255, 255), -1)
@@ -168,7 +217,7 @@ def main():
         fps = 1.0 / (time.time() - start_time)
 
         # Add text stating resolution and frames per second of video capture
-        annotate_video(display_frame, video_width, video_height, fps)
+        annotate_video(display_frame, video_width, video_height, fps, eye_ar, args.ear_threshold)
         cv2.imshow('VideoDetectionModule - RAS', display_frame)
 
         if cv2.waitKey(1) == ord('q'):
