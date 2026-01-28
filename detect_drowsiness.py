@@ -22,7 +22,7 @@ RISK_SEVERITIES = ["MILD", "MODERATE", "SEVERE"]
 
 CAMERA_INDEX    = 0
 TARGET_FPS      = 24
-EAR_THRESHOLD   = 0.15
+EAR_THRESHOLD   = 0.17
 
 
 def setup_logger(log_level):
@@ -109,6 +109,33 @@ def eye_aspect_ratio_handler(shape):
     return averaged_ar
 
 
+def head_pose_handler(shape):
+    """
+    Compute the head pose direction based on facial landmarks.
+
+    :param shape: facial landmarks extracted from the face
+    """
+
+    # Identify key landmarks corresponding to face symmetry
+    nose_bridge = shape[27][0]
+    left_edge   = shape[0][0]
+    right_edge  = shape[16][0]
+
+    face_width = right_edge - left_edge
+    
+    if face_width == 0:
+        return "FORWARD"
+    
+    central_ratio = (nose_bridge - left_edge) / face_width
+
+    if central_ratio < 0.35:
+        return "LEFT"
+    elif central_ratio > 0.65:
+        return "RIGHT"
+    else:
+        return "FORWARD"
+
+
 def get_video_dimensions(video_stream):
     """
     Return the width and height of the video stream
@@ -122,20 +149,22 @@ def get_video_dimensions(video_stream):
     return width, height
 
 
-def annotate_video(frame, video_width, video_height, fps, eye_ar, ear_threshold):
+def annotate_video(frame, video_width, video_height, fps, eye_ar, ear_threshold, head_direction):
     """
     Annotate the video stream with resolution and frame rate information.
 
-    :param frame        : captured frame
-    :param video_width  : width of the video stream
-    :param video_height : height of the video stream
-    :param fps          : frame rate of video stream
-    :param eye_ar       : eye aspect ratio
+    :param frame          : captured frame
+    :param video_width    : width of the video stream
+    :param video_height   : height of the video stream
+    :param fps            : frame rate of video stream
+    :param eye_ar         : eye aspect ratio
+    :param gaze_direction : direction of driver's gaze
     """
 
     resolution_str = f"Resolution: {video_width}x{video_height}"
     fps_str        = f"FPS: {int(fps)}"
     eye_ar_str     = f"Eye Aspect Ratio: {eye_ar:.2f}"
+    head_str       = f"Head Direction: {head_direction}"
 
     if eye_ar < ear_threshold:
         eye_status_str = "EYES CLOSED"
@@ -149,6 +178,7 @@ def annotate_video(frame, video_width, video_height, fps, eye_ar, ear_threshold)
     cv2.putText(frame, fps_str,                       (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200),  2)
     cv2.putText(frame, eye_ar_str,                    (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200),  2)
     cv2.putText(frame, eye_status_str, (video_width - 250, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, eye_status_color, 2)
+    cv2.putText(frame, head_str,       (video_width - 290, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200),  2)
 
 
 def main():
@@ -175,8 +205,9 @@ def main():
         ret, raw_frame = video_stream.read()
         frame = cv2.flip(raw_frame, 1)
         
-        # Eye aspect ratio is initally set to 0
+        # Tracking metrics are reset each iteration
         eye_ar = 0
+        head_direction = "NONE"
 
         if not ret:
             logging.warning("Encountered frame drop. Exiting video stream.")
@@ -202,6 +233,7 @@ def main():
             shape = face_utils.shape_to_np(shape)
 
             eye_ar = eye_aspect_ratio_handler(shape)
+            head_direction = head_pose_handler(shape)
 
             # Draw a face mask using the 68-landmarks extracted with dlib
             for (x, y) in shape:
@@ -217,7 +249,7 @@ def main():
         fps = 1.0 / (time.time() - start_time)
 
         # Add text stating resolution and frames per second of video capture
-        annotate_video(display_frame, video_width, video_height, fps, eye_ar, args.ear_threshold)
+        annotate_video(display_frame, video_width, video_height, fps, eye_ar, args.ear_threshold, head_direction)
         cv2.imshow('VideoDetectionModule - RAS', display_frame)
 
         if cv2.waitKey(1) == ord('q'):
