@@ -24,6 +24,7 @@ CAMERA_INDEX              = 0
 TARGET_FPS                = 24
 EAR_THRESHOLD             = 0.17
 OBSERVATION_SAFETY_WINDOW = 5.0     # [seconds]
+OBSERVATION_LOST_TIMEOUT  = 0.8
 
 CLAHE_LIMIT_NO_BOOST    = 1.0
 CLAHE_LIMIT_LOW_BOOST   = 1.5
@@ -273,7 +274,9 @@ def main():
     video_width, video_height = get_video_dimensions(video_stream)
     detector, predictor = setup_facial_recognition(args.dlib_model)
 
+    last_known_head_direction = "FORWARD"
     observation_status = {"left": 0, "right": 0}
+    observation_timestamp = time.time()
 
     while(True):
         start_time = time.time()
@@ -294,8 +297,6 @@ def main():
         frame_greyscale = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         frame_greyscale, active_clip_limit = adaptive_clahe(frame_greyscale)
 
-        faces = detector(frame_greyscale, 0)
-
         if args.show_simple:
             display_frame = np.zeros((video_height, video_width, 3), dtype=np.uint8)
         else:
@@ -303,24 +304,36 @@ def main():
 
         observation_complete = False
 
-        for face in faces:
-            x_left, x_right = max(0, face.left()), max(0, face.right())
-            y_top, y_bottom = max(0, face.top()), max(0, face.bottom())
+        faces = detector(frame_greyscale, 0)
 
-            # Draw a box around the detected face
-            cv2.rectangle(display_frame, (x_left, y_top), (x_right, y_bottom), (0, 255, 0), 2)
+        if len(faces) > 0:
+            observation_timestamp = time.time()
 
-            shape = predictor(frame_greyscale, face)
-            shape = face_utils.shape_to_np(shape)
+            for face in faces:
+                x_left, x_right = max(0, face.left()), max(0, face.right())
+                y_top, y_bottom = max(0, face.top()), max(0, face.bottom())
 
-            eye_ar = eye_aspect_ratio_handler(shape)
-            head_direction = head_pose_handler(shape)
+                # Draw a box around the detected face
+                cv2.rectangle(display_frame, (x_left, y_top), (x_right, y_bottom), (0, 255, 0), 2)
 
-            observation_complete = check_observation_status(head_direction, observation_status, args.observation_window)
+                shape = predictor(frame_greyscale, face)
+                shape = face_utils.shape_to_np(shape)
 
-            # Draw a face mask using the 68-landmarks extracted with dlib
-            for (x, y) in shape:
-                cv2.circle(display_frame, (x, y), 1, (255, 255, 255), -1)
+                eye_ar = eye_aspect_ratio_handler(shape)
+                head_direction = head_pose_handler(shape)
+                last_known_head_direction = head_direction
+
+                observation_complete = check_observation_status(head_direction, observation_status, args.observation_window)
+
+                # Draw a face mask using the 68-landmarks extracted with dlib
+                for (x, y) in shape:
+                    cv2.circle(display_frame, (x, y), 1, (255, 255, 255), -1)
+        else:
+            if (time.time() - observation_timestamp) < OBSERVATION_LOST_TIMEOUT: 
+                head_direction = last_known_head_direction
+                observation_complete = check_observation_status(head_direction, observation_status, args.observation_window)
+            else:
+                head_direction = "LOST"
 
         # Synchronize loop speed with target fps, providing software capped frame rate
         processing_time = time.time() - start_time
