@@ -25,6 +25,14 @@ TARGET_FPS                = 24
 EAR_THRESHOLD             = 0.17
 OBSERVATION_SAFETY_WINDOW = 5.0     # [seconds]
 
+CLAHE_LIMIT_NO_BOOST    = 1.0
+CLAHE_LIMIT_LOW_BOOST   = 1.5
+CLAHE_LIMIT_MID_BOOST   = 2.0
+CLAHE_LIMIT_HIGH_BOOST  = 2.5
+CLAHE_LIMIT_ULTRA_BOOST = 3.0
+CLAHE_LIMIT_EXTRM_BOOST = 3.5
+CLAHE_LIMIT_MAX_BOOST   = 4.0
+
 
 def setup_logger(log_level):
     """
@@ -130,9 +138,9 @@ def head_pose_handler(shape):
 
     central_ratio = (nose_bridge - left_edge) / face_width
 
-    if central_ratio < 0.35:
+    if central_ratio < 0.40:
         return "LEFT"
-    elif central_ratio > 0.65:
+    elif central_ratio > 0.63:
         return "RIGHT"
     else:
         return "FORWARD"
@@ -173,7 +181,35 @@ def get_video_dimensions(video_stream):
     return width, height
 
 
-def annotate_video(frame, video_width, video_height, fps, eye_ar, ear_threshold, head_direction, observation_complete):
+def adaptive_clahe(frame_greyscale):
+    """
+    Apply adaptive CLAHE (Contrast Limited Adaptive Histogram Equalization) to a greyscale frame.
+
+    :param frame_greyscale : frame captured in video stream converted to COLOR_BGR2GRAY
+    """
+
+    avg_brightness = np.mean(frame_greyscale)
+
+    if avg_brightness > 180:
+        clip_limit = CLAHE_LIMIT_NO_BOOST     # Well lit environment
+    elif avg_brightness > 150:
+        clip_limit = CLAHE_LIMIT_LOW_BOOST
+    elif avg_brightness > 120:
+        clip_limit = CLAHE_LIMIT_MID_BOOST    # Moderately lit environment
+    elif avg_brightness > 90:
+        clip_limit = CLAHE_LIMIT_HIGH_BOOST
+    elif avg_brightness > 60:
+        clip_limit = CLAHE_LIMIT_ULTRA_BOOST
+    elif avg_brightness > 40:
+        clip_limit = CLAHE_LIMIT_EXTRM_BOOST
+    else:
+        clip_limit = CLAHE_LIMIT_MAX_BOOST   # Dim environment
+
+    clahe_model = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=(8, 8))
+    return clahe_model.apply(frame_greyscale), clip_limit
+
+
+def annotate_video(frame, video_width, video_height, fps, eye_ar, ear_threshold, head_direction, observation_complete, active_clip_limit):
     """
     Annotate the video stream with resolution and frame rate information.
 
@@ -183,14 +219,23 @@ def annotate_video(frame, video_width, video_height, fps, eye_ar, ear_threshold,
     :param fps                  : frame rate of video stream
     :param eye_ar               : eye aspect ratio
     :param gaze_direction       : direction of driver's gaze
-    :param observation_complete : Status of the driver observation
+    :param observation_complete : status of the driver observation
+    :param active_clip_limit    : currently applied histogram equalization clip limit
     """
 
+    # Text Strings
     resolution_str = f"Resolution: {video_width}x{video_height}"
     fps_str        = f"FPS: {int(fps)}"
     eye_ar_str     = f"Eye Aspect Ratio: {eye_ar:.2f}"
     head_str       = f"Head Direction: {head_direction}"
     obs_str        = f"Observation Complete: {observation_complete}"
+    clip_str       = f"CLAHE Clip Limit: {active_clip_limit}"
+
+    # Styling Characteristics
+    thickness = 1
+    scale     = 0.6
+    font      = cv2.FONT_HERSHEY_SIMPLEX
+    line_type = cv2.LINE_AA  # Anti-aliasing
 
     if eye_ar < ear_threshold:
         eye_status_str = "EYES CLOSED"
@@ -199,13 +244,16 @@ def annotate_video(frame, video_width, video_height, fps, eye_ar, ear_threshold,
         eye_status_str = "EYES OPEN"
         eye_status_color = (0, 255, 0)
 
-    # Draw annotation elements
-    cv2.putText(frame, resolution_str,                (10, 30), cv2.FONT_HERSHEY_SIMPLEX,  0.7, (200, 200, 200),  2)
-    cv2.putText(frame, fps_str,                       (10, 60), cv2.FONT_HERSHEY_SIMPLEX,  0.7, (200, 200, 200),  2)
-    cv2.putText(frame, eye_ar_str,                    (10, 90), cv2.FONT_HERSHEY_SIMPLEX,  0.7, (200, 200, 200),  2)
-    cv2.putText(frame, eye_status_str, (video_width - 250, 30), cv2.FONT_HERSHEY_SIMPLEX,  0.7, eye_status_color, 2)
-    cv2.putText(frame, head_str,       (video_width - 290, 60), cv2.FONT_HERSHEY_SIMPLEX,  0.7, (200, 200, 200),  2)
-    cv2.putText(frame, obs_str,        (video_width - 310, 90), cv2.FONT_HERSHEY_SIMPLEX,  0.7, (200, 200, 200),  2)
+    # [LEFT-ALIGNED] System stats
+    cv2.putText(frame, fps_str,                       (10, 60), font, 0.5, (200, 200, 200),   thickness, line_type)
+    cv2.putText(frame, resolution_str,                (10, 30), font, 0.5, (200, 200, 200),   thickness, line_type)
+    cv2.putText(frame, eye_ar_str,                    (10, 90), font, 0.5, (200, 200, 200),   thickness, line_type)
+
+    # [RIGHT-ALIGNED] Driver status
+    cv2.putText(frame, eye_status_str, (video_width - 250, 30),  font, 0.5, eye_status_color, thickness, line_type)
+    cv2.putText(frame, head_str,       (video_width - 290, 60),  font, 0.5, (200, 200, 200),  thickness, line_type)
+    cv2.putText(frame, obs_str,        (video_width - 310, 90),  font, 0.5, (200, 200, 200),  thickness, line_type)
+    cv2.putText(frame, clip_str,       (video_width - 310, 120), font, 0.5, (200, 200, 200),  thickness, line_type)
 
 
 def main():
@@ -242,8 +290,10 @@ def main():
             logging.warning("Encountered frame drop. Exiting video stream.")
             break
 
-        # Detect facial landmarks
+        # Detect facial landmarks on histogram equalized frame
         frame_greyscale = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        frame_greyscale, active_clip_limit = adaptive_clahe(frame_greyscale)
+
         faces = detector(frame_greyscale, 0)
 
         if args.show_simple:
@@ -282,7 +332,9 @@ def main():
         fps = 1.0 / (time.time() - start_time)
 
         # Add text stating resolution and frames per second of video capture
-        annotate_video(display_frame, video_width, video_height, fps, eye_ar, args.ear_threshold, head_direction, observation_complete)
+        annotate_video(display_frame, video_width, video_height, fps, eye_ar, args.ear_threshold, head_direction,
+                       observation_complete, active_clip_limit)
+
         cv2.imshow('VideoDetectionModule - RAS', display_frame)
 
         if cv2.waitKey(1) == ord('q'):
