@@ -20,9 +20,10 @@ LANDMARK_PREDICTION_MODEL = "models/shape_predictor_68_face_landmarks.dat"
 LOG_OPTIONS     = ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
 RISK_SEVERITIES = ["MILD", "MODERATE", "SEVERE"]
 
-CAMERA_INDEX    = 0
-TARGET_FPS      = 24
-EAR_THRESHOLD   = 0.17
+CAMERA_INDEX              = 0
+TARGET_FPS                = 24
+EAR_THRESHOLD             = 0.17
+OBSERVATION_SAFETY_WINDOW = 5.0     # [seconds]
 
 
 def setup_logger(log_level):
@@ -49,11 +50,12 @@ def setup_argument_parser():
 
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("-ll", "--log_level",     help="Logging level to use with logging library", default="INFO", choices=LOG_OPTIONS)
-    parser.add_argument("-v",  "--target_fps",    help="Target FPS for video processing", default=TARGET_FPS, type=int)
-    parser.add_argument("-m",  "--dlib_model",    help="Path to the Dlib landmark prediction model", default=LANDMARK_PREDICTION_MODEL, type=str)
-    parser.add_argument("-s",  "--show_simple",   help="Show landmarks on a black canvas instead of raw video", action="store_true")
-    parser.add_argument("-e",  "--ear_threshold", help="Eye aspect ratio threshold for detecting drowsiness", default=EAR_THRESHOLD, type=float)
+    parser.add_argument("-ll", "--log_level",          help="Logging level to use with logging library", default="INFO", choices=LOG_OPTIONS)
+    parser.add_argument("-v",  "--target_fps",         help="Target FPS for video processing", default=TARGET_FPS, type=int)
+    parser.add_argument("-m",  "--dlib_model",         help="Path to the Dlib landmark prediction model", default=LANDMARK_PREDICTION_MODEL, type=str)
+    parser.add_argument("-s",  "--show_simple",        help="Show landmarks on a black canvas instead of raw video", action="store_true")
+    parser.add_argument("-e",  "--ear_threshold",      help="Eye aspect ratio threshold for detecting drowsiness", default=EAR_THRESHOLD, type=float)
+    parser.add_argument("-o",  "--observation_window", help="Observation safety window in seconds", default=OBSERVATION_SAFETY_WINDOW, type=float)
 
     return parser.parse_args()
 
@@ -122,10 +124,10 @@ def head_pose_handler(shape):
     right_edge  = shape[16][0]
 
     face_width = right_edge - left_edge
-    
+
     if face_width == 0:
         return "FORWARD"
-    
+
     central_ratio = (nose_bridge - left_edge) / face_width
 
     if central_ratio < 0.35:
@@ -134,6 +136,28 @@ def head_pose_handler(shape):
         return "RIGHT"
     else:
         return "FORWARD"
+
+
+def check_observation_status(head_direction, observation_status, window):
+    """
+    Check if the driver has completed precautionary observations within a window
+
+    :param head_direction     : The direction the driver's head is facing
+    :param observation_status : A dictionary of timestamps when head direction was recorded
+    :param window             : The time window (in seconds) to consider for observation safety
+    """
+
+    current_time = time.time()
+
+    if head_direction == "LEFT":
+        observation_status["left"] = current_time
+    elif head_direction == "RIGHT":
+        observation_status["right"] = current_time
+
+    left_look_completed = (current_time - observation_status["left"]) < window
+    right_look_completed = (current_time - observation_status["right"]) < window
+
+    return (left_look_completed and right_look_completed)
 
 
 def get_video_dimensions(video_stream):
@@ -149,36 +173,39 @@ def get_video_dimensions(video_stream):
     return width, height
 
 
-def annotate_video(frame, video_width, video_height, fps, eye_ar, ear_threshold, head_direction):
+def annotate_video(frame, video_width, video_height, fps, eye_ar, ear_threshold, head_direction, observation_complete):
     """
     Annotate the video stream with resolution and frame rate information.
 
-    :param frame          : captured frame
-    :param video_width    : width of the video stream
-    :param video_height   : height of the video stream
-    :param fps            : frame rate of video stream
-    :param eye_ar         : eye aspect ratio
-    :param gaze_direction : direction of driver's gaze
+    :param frame                : captured frame
+    :param video_width          : width of the video stream
+    :param video_height         : height of the video stream
+    :param fps                  : frame rate of video stream
+    :param eye_ar               : eye aspect ratio
+    :param gaze_direction       : direction of driver's gaze
+    :param observation_complete : Status of the driver observation
     """
 
     resolution_str = f"Resolution: {video_width}x{video_height}"
     fps_str        = f"FPS: {int(fps)}"
     eye_ar_str     = f"Eye Aspect Ratio: {eye_ar:.2f}"
     head_str       = f"Head Direction: {head_direction}"
+    obs_str        = f"Observation Complete: {observation_complete}"
 
     if eye_ar < ear_threshold:
         eye_status_str = "EYES CLOSED"
         eye_status_color = (0, 0, 255)
     else:
         eye_status_str = "EYES OPEN"
-        eye_status_color = (0, 255, 0)  
+        eye_status_color = (0, 255, 0)
 
     # Draw annotation elements
-    cv2.putText(frame, resolution_str,                (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200),  2)
-    cv2.putText(frame, fps_str,                       (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200),  2)
-    cv2.putText(frame, eye_ar_str,                    (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200),  2)
-    cv2.putText(frame, eye_status_str, (video_width - 250, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, eye_status_color, 2)
-    cv2.putText(frame, head_str,       (video_width - 290, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200),  2)
+    cv2.putText(frame, resolution_str,                (10, 30), cv2.FONT_HERSHEY_SIMPLEX,  0.7, (200, 200, 200),  2)
+    cv2.putText(frame, fps_str,                       (10, 60), cv2.FONT_HERSHEY_SIMPLEX,  0.7, (200, 200, 200),  2)
+    cv2.putText(frame, eye_ar_str,                    (10, 90), cv2.FONT_HERSHEY_SIMPLEX,  0.7, (200, 200, 200),  2)
+    cv2.putText(frame, eye_status_str, (video_width - 250, 30), cv2.FONT_HERSHEY_SIMPLEX,  0.7, eye_status_color, 2)
+    cv2.putText(frame, head_str,       (video_width - 290, 60), cv2.FONT_HERSHEY_SIMPLEX,  0.7, (200, 200, 200),  2)
+    cv2.putText(frame, obs_str,        (video_width - 310, 90), cv2.FONT_HERSHEY_SIMPLEX,  0.7, (200, 200, 200),  2)
 
 
 def main():
@@ -198,13 +225,15 @@ def main():
     video_width, video_height = get_video_dimensions(video_stream)
     detector, predictor = setup_facial_recognition(args.dlib_model)
 
+    observation_status = {"left": 0, "right": 0}
+
     while(True):
         start_time = time.time()
 
         # Continuosly capture a frame with success/failure return value
         ret, raw_frame = video_stream.read()
         frame = cv2.flip(raw_frame, 1)
-        
+
         # Tracking metrics are reset each iteration
         eye_ar = 0
         head_direction = "NONE"
@@ -222,6 +251,8 @@ def main():
         else:
             display_frame = cv2.cvtColor(frame_greyscale, cv2.COLOR_GRAY2BGR)
 
+        observation_complete = False
+
         for face in faces:
             x_left, x_right = max(0, face.left()), max(0, face.right())
             y_top, y_bottom = max(0, face.top()), max(0, face.bottom())
@@ -234,6 +265,8 @@ def main():
 
             eye_ar = eye_aspect_ratio_handler(shape)
             head_direction = head_pose_handler(shape)
+
+            observation_complete = check_observation_status(head_direction, observation_status, args.observation_window)
 
             # Draw a face mask using the 68-landmarks extracted with dlib
             for (x, y) in shape:
@@ -249,7 +282,7 @@ def main():
         fps = 1.0 / (time.time() - start_time)
 
         # Add text stating resolution and frames per second of video capture
-        annotate_video(display_frame, video_width, video_height, fps, eye_ar, args.ear_threshold, head_direction)
+        annotate_video(display_frame, video_width, video_height, fps, eye_ar, args.ear_threshold, head_direction, observation_complete)
         cv2.imshow('VideoDetectionModule - RAS', display_frame)
 
         if cv2.waitKey(1) == ord('q'):
