@@ -59,12 +59,13 @@ def setup_argument_parser():
 
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("-ll", "--log_level",          help="Logging level to use with logging library", default="INFO", choices=LOG_OPTIONS)
-    parser.add_argument("-v",  "--target_fps",         help="Target FPS for video processing", default=TARGET_FPS, type=int)
-    parser.add_argument("-m",  "--dlib_model",         help="Path to the Dlib landmark prediction model", default=LANDMARK_PREDICTION_MODEL, type=str)
-    parser.add_argument("-s",  "--show_simple",        help="Show landmarks on a black canvas instead of raw video", action="store_true")
-    parser.add_argument("-e",  "--ear_threshold",      help="Eye aspect ratio threshold for detecting drowsiness", default=EAR_THRESHOLD, type=float)
-    parser.add_argument("-o",  "--observation_window", help="Observation safety window in seconds", default=OBSERVATION_SAFETY_WINDOW, type=float)
+    parser.add_argument("-ll",  "--log_level",          help="Logging level to use with logging library", default="INFO", choices=LOG_OPTIONS)
+    parser.add_argument("-fps", "--target_fps",         help="Target FPS for video processing", default=TARGET_FPS, type=int)
+    parser.add_argument("-m",   "--dlib_model",         help="Path to the Dlib landmark prediction model", default=LANDMARK_PREDICTION_MODEL, type=str)
+    parser.add_argument("-s",   "--show_simple",        help="Show landmarks on a black canvas instead of raw video", action="store_true")
+    parser.add_argument("-e",   "--ear_threshold",      help="Eye aspect ratio threshold for detecting drowsiness", default=EAR_THRESHOLD, type=float)
+    parser.add_argument("-o",   "--observation_window", help="Observation safety window in seconds", default=OBSERVATION_SAFETY_WINDOW, type=float)
+    parser.add_argument("-da",  "--disable_annotation", help="Disable annotation on video output", action="store_true")
 
     return parser.parse_args()
 
@@ -224,12 +225,22 @@ def annotate_video(frame, video_width, video_height, fps, eye_ar, ear_threshold,
     :param active_clip_limit    : currently applied histogram equalization clip limit
     """
 
+    # Blend overlay into original frame to achieve semi-transparent effect
+    overlay = frame.copy()
+
+    panel_height = 135
+    left_panel_width, right_panel_width = 240, 260
+    alpha, beta = 0.7, 0.3
+
+    cv2.rectangle(overlay, (0, 0), (left_panel_width, panel_height), (0, 0, 0), -1)                           # System stats
+    cv2.rectangle(overlay, (video_width - right_panel_width, 0), (video_width, panel_height), (0, 0, 0), -1)  # Driver status
+    cv2.addWeighted(overlay, alpha, frame, beta, 0, frame)
+
     # Text Strings
     resolution_str = f"Resolution: {video_width}x{video_height}"
     fps_str        = f"FPS: {int(fps)}"
     eye_ar_str     = f"Eye Aspect Ratio: {eye_ar:.2f}"
     head_str       = f"Head Direction: {head_direction}"
-    obs_str        = f"Observation Complete: {observation_complete}"
     clip_str       = f"CLAHE Clip Limit: {active_clip_limit}"
 
     # Styling Characteristics
@@ -238,23 +249,33 @@ def annotate_video(frame, video_width, video_height, fps, eye_ar, ear_threshold,
     font      = cv2.FONT_HERSHEY_SIMPLEX
     line_type = cv2.LINE_AA  # Anti-aliasing
 
-    if eye_ar < ear_threshold:
+    if head_direction == "LOST":
+        eye_status_str   = "FACE LOST"
+        eye_status_color = (0, 165, 255)
+    elif eye_ar < ear_threshold:
         eye_status_str = "EYES CLOSED"
         eye_status_color = (0, 0, 255)
     else:
         eye_status_str = "EYES OPEN"
         eye_status_color = (0, 255, 0)
+        
+    if observation_complete:
+        obs_status_str = "OBSERVATION COMPLETE"
+        obs_status_color = (0, 255, 0)
+    else:
+        obs_status_str = "OBSERVATION INCOMPLETE"
+        obs_status_color = (0, 0, 255)
 
     # [LEFT-ALIGNED] System stats
-    cv2.putText(frame, fps_str,                       (10, 60), font, 0.5, (200, 200, 200),   thickness, line_type)
-    cv2.putText(frame, resolution_str,                (10, 30), font, 0.5, (200, 200, 200),   thickness, line_type)
-    cv2.putText(frame, eye_ar_str,                    (10, 90), font, 0.5, (200, 200, 200),   thickness, line_type)
+    cv2.putText(frame, fps_str,        (10, 60),  font, 0.5, (200, 200, 200),  thickness, line_type)
+    cv2.putText(frame, resolution_str, (10, 30),  font, 0.5, (200, 200, 200),  thickness, line_type)
+    cv2.putText(frame, eye_ar_str,     (10, 90),  font, 0.5, (200, 200, 200),  thickness, line_type)
+    cv2.putText(frame, clip_str,       (10, 120), font, 0.5, (200, 200, 200),  thickness, line_type)
 
     # [RIGHT-ALIGNED] Driver status
-    cv2.putText(frame, eye_status_str, (video_width - 250, 30),  font, 0.5, eye_status_color, thickness, line_type)
-    cv2.putText(frame, head_str,       (video_width - 290, 60),  font, 0.5, (200, 200, 200),  thickness, line_type)
-    cv2.putText(frame, obs_str,        (video_width - 310, 90),  font, 0.5, (200, 200, 200),  thickness, line_type)
-    cv2.putText(frame, clip_str,       (video_width - 310, 120), font, 0.5, (200, 200, 200),  thickness, line_type)
+    cv2.putText(frame, eye_status_str, (video_width - 175, 60),  font, 0.5, eye_status_color, thickness, line_type)
+    cv2.putText(frame, head_str,       (video_width - 240, 30),  font, 0.5, (200, 200, 200),  thickness, line_type)
+    cv2.putText(frame, obs_status_str, (video_width - 240, 90),  font, 0.5, obs_status_color, thickness, line_type)
 
 
 def main():
@@ -329,7 +350,7 @@ def main():
                 for (x, y) in shape:
                     cv2.circle(display_frame, (x, y), 1, (255, 255, 255), -1)
         else:
-            if (time.time() - observation_timestamp) < OBSERVATION_LOST_TIMEOUT: 
+            if (time.time() - observation_timestamp) < OBSERVATION_LOST_TIMEOUT:
                 head_direction = last_known_head_direction
                 observation_complete = check_observation_status(head_direction, observation_status, args.observation_window)
             else:
@@ -341,12 +362,12 @@ def main():
         if processing_time < frame_duration:
             time.sleep(frame_duration - processing_time)
 
-        # Compute real-time fps of the video stream
         fps = 1.0 / (time.time() - start_time)
 
         # Add text stating resolution and frames per second of video capture
-        annotate_video(display_frame, video_width, video_height, fps, eye_ar, args.ear_threshold, head_direction,
-                       observation_complete, active_clip_limit)
+        if not args.disable_annotation:
+            annotate_video(display_frame, video_width, video_height, fps, eye_ar, args.ear_threshold, head_direction,
+                           observation_complete, active_clip_limit)
 
         cv2.imshow('VideoDetectionModule - RAS', display_frame)
 
