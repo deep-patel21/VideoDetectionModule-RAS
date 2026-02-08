@@ -34,6 +34,8 @@ CLAHE_LIMIT_ULTRA_BOOST = 3.0
 CLAHE_LIMIT_EXTRM_BOOST = 3.5
 CLAHE_LIMIT_MAX_BOOST   = 4.0
 
+DOWNSCALED_FRAME_WIDTH_PX = 320
+
 
 def setup_logger(log_level):
     """
@@ -81,6 +83,7 @@ def setup_facial_recognition(dlib_model_path):
         logging.error(f"Landmark prediction model not found at {dlib_model_path}")
         exit()
 
+    # Use the Histogram of Oriented Gradients (HOG) detection from dlib
     detector = dlib.get_frontal_face_detector()
     predictor = dlib.shape_predictor(dlib_model_path)
 
@@ -258,7 +261,7 @@ def annotate_video(frame, video_width, video_height, fps, eye_ar, ear_threshold,
     else:
         eye_status_str = "EYES OPEN"
         eye_status_color = (0, 255, 0)
-        
+
     if observation_complete:
         obs_status_str = "OBSERVATION COMPLETE"
         obs_status_color = (0, 255, 0)
@@ -295,6 +298,9 @@ def main():
     video_width, video_height = get_video_dimensions(video_stream)
     detector, predictor = setup_facial_recognition(args.dlib_model)
 
+    downscale_ratio = video_width / DOWNSCALED_FRAME_WIDTH_PX
+    downscale_height = int(video_height / downscale_ratio)
+
     last_known_head_direction = "FORWARD"
     observation_status = {"left": 0, "right": 0}
     observation_timestamp = time.time()
@@ -305,6 +311,7 @@ def main():
         # Continuosly capture a frame with success/failure return value
         ret, raw_frame = video_stream.read()
         frame = cv2.flip(raw_frame, 1)
+        frame_downscaled = cv2.resize(frame, (DOWNSCALED_FRAME_WIDTH_PX, downscale_height))
 
         # Tracking metrics are reset each iteration
         eye_ar = 0
@@ -315,40 +322,41 @@ def main():
             break
 
         # Detect facial landmarks on histogram equalized frame
-        frame_greyscale = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        frame_greyscale = cv2.cvtColor(frame_downscaled, cv2.COLOR_BGR2GRAY)
         frame_greyscale, active_clip_limit = adaptive_clahe(frame_greyscale)
 
         if args.show_simple:
             display_frame = np.zeros((video_height, video_width, 3), dtype=np.uint8)
         else:
-            display_frame = cv2.cvtColor(frame_greyscale, cv2.COLOR_GRAY2BGR)
+            frame_greyscale_upscaled = cv2.resize(frame_greyscale, (video_width, video_height))
+            display_frame = cv2.cvtColor(frame_greyscale_upscaled, cv2.COLOR_GRAY2BGR)
 
         observation_complete = False
 
+        # Keep the second parameter set to 0 for no scaling before detection
         faces = detector(frame_greyscale, 0)
 
         if len(faces) > 0:
             observation_timestamp = time.time()
 
             for face in faces:
-                x_left, x_right = max(0, face.left()), max(0, face.right())
-                y_top, y_bottom = max(0, face.top()), max(0, face.bottom())
-
-                # Draw a box around the detected face
-                cv2.rectangle(display_frame, (x_left, y_top), (x_right, y_bottom), (0, 255, 0), 2)
-
-                shape = predictor(frame_greyscale, face)
-                shape = face_utils.shape_to_np(shape)
+                shape_downscaled = predictor(frame_greyscale, face)
+                shape_array      = face_utils.shape_to_np(shape_downscaled)
+                shape            = (shape_array * downscale_ratio).astype('int')
 
                 eye_ar = eye_aspect_ratio_handler(shape)
                 head_direction = head_pose_handler(shape)
                 last_known_head_direction = head_direction
 
-                observation_complete = check_observation_status(head_direction, observation_status, args.observation_window)
+                # Draw a box around the detected face
+                x_left, x_right, y_top, y_bottom =  [int(v * downscale_ratio) for v in [face.left(), face.right(), face.top(), face.bottom()]]
+                cv2.rectangle(display_frame, (x_left, y_top), (x_right, y_bottom), (0, 255, 0), 2)
 
                 # Draw a face mask using the 68-landmarks extracted with dlib
                 for (x, y) in shape:
                     cv2.circle(display_frame, (x, y), 1, (255, 255, 255), -1)
+
+                observation_complete = check_observation_status(head_direction, observation_status, args.observation_window)
         else:
             if (time.time() - observation_timestamp) < OBSERVATION_LOST_TIMEOUT:
                 head_direction = last_known_head_direction
