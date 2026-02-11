@@ -1,9 +1,11 @@
 import os
 import cv2
+import csv
 import dlib
+import json
 import time
-import argparse
 import logging
+import argparse
 import numpy as np
 
 from threading import Thread
@@ -37,6 +39,90 @@ CLAHE_LIMIT_MAX_BOOST   = 4.0
 DOWNSCALED_FRAME_WIDTH_PX = 320
 
 
+class VideoLogger:
+    """
+    A logger class to record video processing metrics into a CSV file.
+    """
+
+    def __init__(self, active=False, buffer_size=100):
+        self.active = active
+
+        self.folder   = "csv_logs"
+        self.filename = os.path.join(self.folder, f"video_log_{int(time.time())}.csv")
+
+        self.data   = []
+        self.buffer = []
+        self.buffer_size = buffer_size
+
+        if self.active:
+            if not os.path.exists(self.folder):
+                os.makedirs(self.folder)
+
+            with open(self.filename, "w", newline='') as log_file:
+                writer = csv.writer(log_file)
+                writer.writerow(["timestamp", "eye_ar", "head_direction", "observation_complete"])
+
+    def record(self, eye_ar, head_direction, observation_complete):
+        if self.active:
+            timestamp = time.time()
+
+            eye_ar_short = round(float(eye_ar), 3)
+            self.buffer.append([timestamp, eye_ar_short, head_direction, int(observation_complete)])
+
+            # Flush the buffer when buffer_size is filled
+            if len(self.buffer) >= self.buffer_size:
+                self.flush_buffer()
+
+    def flush_buffer(self):
+        if self.buffer:
+            with open(self.filename, "a", newline='') as log_file:
+                writer = csv.writer(log_file)
+                writer.writerows(self.buffer)
+
+            # Clear the buffer after write operation
+            self.buffer = []
+
+
+def update_json_status(eye_ar, head_direction, observation_complete, ear_threshold):
+    """
+    Update the status JSON file with the latest eye aspect ratio, head direction, and observation status.
+
+    :param eye_ar               : eye aspect ratio
+    :param head_direction       : direction of driver's gaze
+    :param observation_complete : status of the driver observation
+    :param ear_threshold        : eye aspect ratio threshold for determining driver status
+    """
+
+    status = {
+        "timestamp": time.time(),
+        "driver_status": "ALERT" if eye_ar >= ear_threshold else "DROWSY",
+        "head_direction": head_direction,
+        "observation_complete": observation_complete
+    }
+
+    folder = "json_statuses"
+    if not os.path.exists(folder):
+        os.makedirs(folder)
+
+    status_path = os.path.join(folder, "video_status.json")
+    tmp_path    = os.path.join(folder, "video_status.json.tmp")
+
+    with open(tmp_path, "w") as json_file:
+        json.dump(status, json_file, indent=4)
+
+    retries = 5
+
+    for x in range(retries):
+        try:
+            os.replace(tmp_path, status_path)
+            break
+        except PermissionError:
+            if x < retries - 1:
+                time.sleep(0.1)
+            else:
+                logging.warning("Status JSON is locked by another process. Skipping update.")
+
+
 def setup_logger(log_level):
     """
     Setup logger with the specified log level.
@@ -68,6 +154,8 @@ def setup_argument_parser():
     parser.add_argument("-e",   "--ear_threshold",      help="Eye aspect ratio threshold for detecting drowsiness", default=EAR_THRESHOLD, type=float)
     parser.add_argument("-o",   "--observation_window", help="Observation safety window in seconds", default=OBSERVATION_SAFETY_WINDOW, type=float)
     parser.add_argument("-da",  "--disable_annotation", help="Disable annotation on video output", action="store_true")
+    parser.add_argument("-p",   "--plot",               help="Generate performance and metric plots on exit", action="store_true")
+    parser.add_argument("-l",   "--log",                help="Enable csv logging", action="store_true")
 
     return parser.parse_args()
 
@@ -223,6 +311,7 @@ def annotate_video(frame, video_width, video_height, fps, eye_ar, ear_threshold,
     :param video_height         : height of the video stream
     :param fps                  : frame rate of video stream
     :param eye_ar               : eye aspect ratio
+    :param ear_threshold        : eye aspect ratio threshold for determining driver status
     :param gaze_direction       : direction of driver's gaze
     :param observation_complete : status of the driver observation
     :param active_clip_limit    : currently applied histogram equalization clip limit
@@ -248,7 +337,7 @@ def annotate_video(frame, video_width, video_height, fps, eye_ar, ear_threshold,
 
     # Styling Characteristics
     thickness = 1
-    scale     = 0.6
+    scale     = 0.5
     font      = cv2.FONT_HERSHEY_SIMPLEX
     line_type = cv2.LINE_AA  # Anti-aliasing
 
@@ -270,21 +359,22 @@ def annotate_video(frame, video_width, video_height, fps, eye_ar, ear_threshold,
         obs_status_color = (0, 0, 255)
 
     # [LEFT-ALIGNED] System stats
-    cv2.putText(frame, fps_str,        (10, 60),  font, 0.5, (200, 200, 200),  thickness, line_type)
-    cv2.putText(frame, resolution_str, (10, 30),  font, 0.5, (200, 200, 200),  thickness, line_type)
-    cv2.putText(frame, eye_ar_str,     (10, 90),  font, 0.5, (200, 200, 200),  thickness, line_type)
-    cv2.putText(frame, clip_str,       (10, 120), font, 0.5, (200, 200, 200),  thickness, line_type)
+    cv2.putText(frame, fps_str,        (10, 60),  font, scale, (200, 200, 200),  thickness, line_type)
+    cv2.putText(frame, resolution_str, (10, 30),  font, scale, (200, 200, 200),  thickness, line_type)
+    cv2.putText(frame, eye_ar_str,     (10, 90),  font, scale, (200, 200, 200),  thickness, line_type)
+    cv2.putText(frame, clip_str,       (10, 120), font, scale, (200, 200, 200),  thickness, line_type)
 
     # [RIGHT-ALIGNED] Driver status
-    cv2.putText(frame, eye_status_str, (video_width - 175, 60),  font, 0.5, eye_status_color, thickness, line_type)
-    cv2.putText(frame, head_str,       (video_width - 240, 30),  font, 0.5, (200, 200, 200),  thickness, line_type)
-    cv2.putText(frame, obs_status_str, (video_width - 240, 90),  font, 0.5, obs_status_color, thickness, line_type)
+    cv2.putText(frame, eye_status_str, (video_width - 175, 60),  font, scale, eye_status_color, thickness, line_type)
+    cv2.putText(frame, head_str,       (video_width - 240, 30),  font, scale, (200, 200, 200),  thickness, line_type)
+    cv2.putText(frame, obs_status_str, (video_width - 240, 90),  font, scale, obs_status_color, thickness, line_type)
 
 
 def main():
     args = setup_argument_parser()
     setup_logger(args.log_level)
 
+    video_logger = VideoLogger(active=args.log)
     video_stream = cv2.VideoCapture(CAMERA_INDEX)
 
     target_fps = args.target_fps
@@ -364,6 +454,11 @@ def main():
             else:
                 head_direction = "LOST"
 
+        if args.log:
+            video_logger.record(eye_ar, head_direction, observation_complete)
+
+        update_json_status(eye_ar, head_direction, observation_complete, args.ear_threshold)
+
         # Synchronize loop speed with target fps, providing software capped frame rate
         processing_time = time.time() - start_time
 
@@ -385,6 +480,10 @@ def main():
     # Close the video stream and corresponding windows after usage
     video_stream.release()
     cv2.destroyAllWindows()
+
+    if args.log:
+        video_logger.flush_buffer()
+        logging.info(f"Logs successfully saved to {video_logger.filename}")
 
 
 if __name__ == "__main__":
