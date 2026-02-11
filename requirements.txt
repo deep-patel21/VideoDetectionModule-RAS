@@ -4,3 +4,5 @@ imutils
 scipy
 cmake
 dlib-bin
+pandas
+matplotlib
