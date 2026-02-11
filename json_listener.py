@@ -1,4 +1,5 @@
 import os
+import sys
 import time
 import json
 
@@ -39,3 +40,4 @@ try:
         time.sleep(0.5)
 except KeyboardInterrupt:
     print("\n[INFO] Exiting listening session.")
+    sys.exit(0)
