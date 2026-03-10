@@ -24,6 +24,7 @@ RISK_SEVERITIES = ["MILD", "MODERATE", "SEVERE"]
 
 CAMERA_INDEX              = 0
 TARGET_FPS                = 24
+DETECTION_SKIPPED_FRAMES  = 3
 EAR_THRESHOLD             = 0.17
 OBSERVATION_SAFETY_WINDOW = 5.0     # [seconds]
 OBSERVATION_LOST_TIMEOUT  = 0.8
@@ -391,14 +392,19 @@ def main():
     downscale_ratio = video_width / DOWNSCALED_FRAME_WIDTH_PX
     downscale_height = int(video_height / downscale_ratio)
 
+    # Observation maintenance variables
     last_known_head_direction = "FORWARD"
     observation_status = {"left": 0, "right": 0}
     observation_timestamp = time.time()
 
+    # Detection optimization variables
+    frame_count      = 0
+    last_known_faces = []
+
     while(True):
         start_time = time.time()
 
-        # Continuosly capture a frame with success/failure return value
+        # Continuously capture a frame with success/failure return value
         ret, raw_frame = video_stream.read()
         frame = cv2.flip(raw_frame, 1)
         frame_downscaled = cv2.resize(frame, (DOWNSCALED_FRAME_WIDTH_PX, downscale_height))
@@ -423,8 +429,13 @@ def main():
 
         observation_complete = False
 
-        # Keep the second parameter set to 0 for no scaling before detection
-        faces = detector(frame_greyscale, 0)
+        if frame_count % DETECTION_SKIPPED_FRAMES == 0:
+            # Keep the second parameter set to 0 for no scaling before detection
+            faces = detector(frame_greyscale, 0)
+            last_known_faces = faces
+        else:
+            # For skipped frames, reuse the previously detected face
+            faces = last_known_faces
 
         if len(faces) > 0:
             observation_timestamp = time.time()
@@ -466,6 +477,7 @@ def main():
             time.sleep(frame_duration - processing_time)
 
         fps = 1.0 / (time.time() - start_time)
+        frame_count += 1
 
         # Add text stating resolution and frames per second of video capture
         if not args.disable_annotation:
