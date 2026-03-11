@@ -7,6 +7,9 @@ cmake
 dlib-bin
 pandas
 matplotlib
+fastapi
+pydantic
+uvicorn
 
 # Linux-specific
 picamera2; sys_platform == "linux"
