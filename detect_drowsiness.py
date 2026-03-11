@@ -61,7 +61,7 @@ class CameraStream:
             logging.info("Video Capture Method: Picamera2")
             self.setup_picamera()
         else:
-            logging.info("Video Capture Method: OpenCV VideoCapture")
+            logging.info("Video Capture Method: OpenCV")
             self.setup_opencv_videocapture()
 
     def setup_opencv_videocapture(self):
@@ -79,6 +79,12 @@ class CameraStream:
 
         self.cam.start()
         self.is_picamera = True
+
+    def get_camera_type(self):
+        if self.is_picamera:
+            return "Picamera2"
+        else:
+            return "OpenCV"
 
     def isOperational(self):
         if self.is_picamera:
@@ -357,13 +363,14 @@ def get_adaptive_clahe_model(frame_greyscale):
     return clahe_model, clip_limit
 
 
-def annotate_video(frame, video_width, video_height, fps, eye_ar, ear_threshold, head_direction, observation_complete, active_clip_limit):
+def annotate_video(frame, video_width, video_height, video_type, fps, eye_ar, ear_threshold, head_direction, observation_complete, active_clip_limit):
     """
     Annotate the video stream with resolution and frame rate information.
 
     :param frame                : captured frame
     :param video_width          : width of the video stream
     :param video_height         : height of the video stream
+    :param video_type           : type of video capture method
     :param fps                  : frame rate of video stream
     :param eye_ar               : eye aspect ratio
     :param ear_threshold        : eye aspect ratio threshold for determining driver status
@@ -389,6 +396,7 @@ def annotate_video(frame, video_width, video_height, fps, eye_ar, ear_threshold,
     eye_ar_str     = f"Eye Aspect Ratio: {eye_ar:.2f}"
     head_str       = f"Head Direction: {head_direction}"
     clip_str       = f"CLAHE Clip Limit: {active_clip_limit}"
+    video_type_str = f"Camera: {video_type}"
 
     # Styling Characteristics
     thickness = 1
@@ -424,8 +432,12 @@ def annotate_video(frame, video_width, video_height, fps, eye_ar, ear_threshold,
     cv2.putText(frame, head_str,       (video_width - 240, 30),  font, scale, (200, 200, 200),  thickness, line_type)
     cv2.putText(frame, obs_status_str, (video_width - 240, 90),  font, scale, obs_status_color, thickness, line_type)
 
+    # [BOTTOM-ALIGNED] Video stats
+    cv2.putText(frame, video_type_str, (video_width - 175, video_height - 15), font, scale, (200, 200, 200), thickness, line_type)
+
 
 def main():
+    logging.info("Starting VideoDetectionModule-RAS...")
     args = setup_argument_parser()
 
     target_fps = args.target_fps
@@ -434,6 +446,7 @@ def main():
     setup_logger(args.log_level)
     video_logger = VideoLogger(active=args.log)
     video_stream = CameraStream(index=CAMERA_INDEX)
+    video_type   = video_stream.get_camera_type()
     
     # The program should not continue if the camera failed to initialize
     if not video_stream.isOperational():
@@ -468,6 +481,10 @@ def main():
         if not ret:
             logging.warning("Encountered frame drop. Exiting video stream.")
             break
+
+        if raw_frame is None or raw_frame.size == 0:
+            logging.warning("Empty frame received. Skipping processing.")
+            continue
 
         frame = cv2.flip(raw_frame, 1)
         frame_downscaled = cv2.resize(frame, (DOWNSCALED_FRAME_WIDTH_PX, downscale_height))
@@ -544,7 +561,7 @@ def main():
 
         # Add text stating resolution and frames per second of video capture
         if not args.disable_annotation:
-            annotate_video(display_frame, video_width, video_height, fps, eye_ar, args.ear_threshold, head_direction,
+            annotate_video(display_frame, video_width, video_height, video_type, fps, eye_ar, args.ear_threshold, head_direction,
                            observation_complete, active_clip_limit)
 
         cv2.imshow('VideoDetectionModule - RAS', display_frame)
