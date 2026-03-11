@@ -56,19 +56,20 @@ To show a simplified real-time view of what the module is doing, users can run `
 
 ### Logging Utilities
 The system use two logging methods to separate inter-module communication for the Risk Avoidance System (RAS) from post usage analysis logs.
-#### JSON Payload
-The file: ```json_statuses/video_status.json``` is used as a one-time status output that combines with other modules of the RAS system to classify a risk rating. The information stamped in this payload annotated on the real-time visualizer, but not stored. Users can listen to the outputs through the provided listener script.
+#### FastAPI (Inter-module Communication)
+The file: ```videodetectionmodule_api.py``` is used as a status output that operates at the target frame rate to publish relevant information to a FastAPI status endpoint. The information stamped in this payload are also annotated on the real-time visualizer, but not stored. Users can listen to the outputs through the provided listener script.
 
 <details>
-  <summary>json_listener.py</summary>
+  <summary>api_listener.py</summary>
 
   1. Open a new terminal window.
-  2. Ensure detect_drowsiness.py is running.
+  2. Ensure detect_drowsiness.py is running. The ```--disable_api``` flag should NOT be used.
   &emsp; i.e. ```python3 detect_drowsiness.py```
-  3. Run the listener with json_listener.py.
+  3. Run the listener with api_listener.py. The default polling interval operates every 0.02 seconds, but can be changed with ```--interval```.
+  &emsp; i.e. ```python3 api_listener.py```
 </details>
 
-#### CSV Log Files
+#### CSV Files (Analysis Logs)
 By using the optional flag ```-l``` or ```--log```, the script will record and store a .csv file in ```csv_logs/``` with the timestamp of your session.
 <br>
 ![csv_logs_directory](documentation_images/csv_logs_storage.png)
