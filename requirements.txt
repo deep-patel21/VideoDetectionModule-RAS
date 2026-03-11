@@ -1,3 +1,4 @@
+# Cross-platform
 opencv-python
 numpy
 imutils
@@ -6,3 +7,6 @@ cmake
 dlib-bin
 pandas
 matplotlib
+
+# Linux-specific
+picamera2; sys_platform == "linux"

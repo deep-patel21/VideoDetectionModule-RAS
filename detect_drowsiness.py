@@ -8,11 +8,15 @@ import logging
 import argparse
 import numpy as np
 
-from threading import Thread
 from imutils import face_utils
-from imutils.video import VideoStream
 from scipy.spatial import distance
 
+# Protection against dependency errors on non-linux platforms
+try:
+    from picamera2 import Picamera2
+    PICAMERA_AVAILABLE = True
+except ImportError:
+    PICAMERA_AVAILABLE = False
 
 LANDMARK_PREDICTION_MODEL = "models/shape_predictor_68_face_landmarks.dat"
 
@@ -30,6 +34,9 @@ EAR_THRESHOLD             = 0.17
 OBSERVATION_SAFETY_WINDOW = 5.0     # [seconds]
 OBSERVATION_LOST_TIMEOUT  = 0.8
 
+FRAME_WIDTH  = 640
+FRAME_HEIGHT = 480
+
 CLAHE_LIMIT_NO_BOOST    = 1.0
 CLAHE_LIMIT_LOW_BOOST   = 1.5
 CLAHE_LIMIT_MID_BOOST   = 2.0
@@ -39,6 +46,65 @@ CLAHE_LIMIT_EXTRM_BOOST = 3.5
 CLAHE_LIMIT_MAX_BOOST   = 4.0
 
 DOWNSCALED_FRAME_WIDTH_PX = 320
+
+
+class CameraStream:
+    """
+    A wrapper class to select and operate a video stream based on available dependencies.
+    """
+
+    def __init__(self, index=CAMERA_INDEX):
+        self.is_picamera = False
+        self.cam = None
+
+        if PICAMERA_AVAILABLE:
+            logging.info("Video Capture Method: Picamera2")
+            self.setup_picamera()
+        else:
+            logging.info("Video Capture Method: OpenCV VideoCapture")
+            self.setup_opencv_videocapture()
+
+    def setup_opencv_videocapture(self):
+        self.cam = cv2.VideoCapture(CAMERA_INDEX)
+
+    def setup_picamera(self):
+        self.cam = Picamera2()
+
+        # Picamera configuration
+        picam_config = self.cam.create_preview_configuration(main={"size": (FRAME_WIDTH, FRAME_HEIGHT)})
+        self.cam.configure(picam_config)
+
+        # Picamera controls
+        self.cam.set_controls({"AfMode": 2})
+
+        self.cam.start()
+        self.is_picamera = True
+
+    def isOperational(self):
+        if self.is_picamera:
+            return self.cam is not None
+        else:
+            return self.cam is not None and self.cam.isOpened()
+
+    def read(self):
+        if self.is_picamera:
+            return True, self.cam.capture_array()
+        else:
+            return self.cam.read()
+        
+    def release(self):
+        if self.cam is not None:
+            if self.is_picamera:
+                self.cam.stop()
+            else:
+                self.cam.release()
+
+    def get_dimensions(self):
+        if self.is_picamera:
+            return FRAME_WIDTH, FRAME_HEIGHT
+        else:
+            return (int(self.cam.get(cv2.CAP_PROP_FRAME_WIDTH)),
+                    int(self.cam.get(cv2.CAP_PROP_FRAME_HEIGHT)))
 
 
 class VideoLogger:
@@ -263,19 +329,6 @@ def check_observation_status(head_direction, observation_status, window):
     return (left_look_completed and right_look_completed)
 
 
-def get_video_dimensions(video_stream):
-    """
-    Return the width and height of the video stream
-
-    :param video_stream: instance of cv2 VideoCapture
-    """
-
-    width = int(video_stream.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(video_stream.get(cv2.CAP_PROP_FRAME_HEIGHT))
-
-    return width, height
-
-
 def get_adaptive_clahe_model(frame_greyscale):
     """
     Apply adaptive CLAHE (Contrast Limited Adaptive Histogram Equalization) to a greyscale frame.
@@ -374,23 +427,23 @@ def annotate_video(frame, video_width, video_height, fps, eye_ar, ear_threshold,
 
 def main():
     args = setup_argument_parser()
-    setup_logger(args.log_level)
-
-    video_logger = VideoLogger(active=args.log)
-    video_stream = cv2.VideoCapture(CAMERA_INDEX)
 
     target_fps = args.target_fps
     frame_duration = 1 / target_fps
 
-    # The program should not continue if the webcam failed to initialize
-    if not video_stream.isOpened():
+    setup_logger(args.log_level)
+    video_logger = VideoLogger(active=args.log)
+    video_stream = CameraStream(index=CAMERA_INDEX)
+    
+    # The program should not continue if the camera failed to initialize
+    if not video_stream.isOperational():
         logging.error("Camera failed to operate")
         exit()
 
-    video_width, video_height = get_video_dimensions(video_stream)
-    detector, predictor = setup_facial_recognition(args.dlib_model)
+    video_width, video_height = video_stream.get_dimensions()
+    detector, predictor       = setup_facial_recognition(args.dlib_model)
 
-    downscale_ratio = video_width / DOWNSCALED_FRAME_WIDTH_PX
+    downscale_ratio  = video_width / DOWNSCALED_FRAME_WIDTH_PX
     downscale_height = int(video_height / downscale_ratio)
 
     # Observation maintenance variables
@@ -402,21 +455,26 @@ def main():
     frame_count      = 0
     last_known_faces = []
 
+    # Contrast adjustment defaults
+    frame_default = np.zeros((downscale_height, DOWNSCALED_FRAME_WIDTH_PX), dtype=np.uint8)
+    clahe_model, active_clip_limit = get_adaptive_clahe_model(frame_default)
+
     while(True):
         start_time = time.time()
 
         # Continuously capture a frame with success/failure return value
         ret, raw_frame = video_stream.read()
+
+        if not ret:
+            logging.warning("Encountered frame drop. Exiting video stream.")
+            break
+
         frame = cv2.flip(raw_frame, 1)
         frame_downscaled = cv2.resize(frame, (DOWNSCALED_FRAME_WIDTH_PX, downscale_height))
 
         # Tracking metrics are reset each iteration
         eye_ar = 0
         head_direction = "NONE"
-
-        if not ret:
-            logging.warning("Encountered frame drop. Exiting video stream.")
-            break
 
         # Detect facial landmarks on frame, applying histogram equalization periodically for improved detection
         frame_greyscale = cv2.cvtColor(frame_downscaled, cv2.COLOR_BGR2GRAY)
