@@ -2,14 +2,18 @@ import os
 import cv2
 import csv
 import dlib
-import json
+# import json
 import time
 import logging
 import argparse
 import numpy as np
 
+from threading import Thread
 from imutils import face_utils
 from scipy.spatial import distance
+
+from videodetectionmode_api import start_api, update_status
+from videodetectionmode_api import HOST_NAME, PORT_NUMBER
 
 # Protection against dependency errors on non-linux platforms
 try:
@@ -157,44 +161,44 @@ class VideoLogger:
             self.buffer = []
 
 
-def update_json_status(eye_ar, head_direction, observation_complete, ear_threshold):
-    """
-    Update the status JSON file with the latest eye aspect ratio, head direction, and observation status.
+# def update_json_status(eye_ar, head_direction, observation_complete, ear_threshold):
+#     """
+#     Update the status JSON file with the latest eye aspect ratio, head direction, and observation status.
 
-    :param eye_ar               : eye aspect ratio
-    :param head_direction       : direction of driver's gaze
-    :param observation_complete : status of the driver observation
-    :param ear_threshold        : eye aspect ratio threshold for determining driver status
-    """
+#     :param eye_ar               : eye aspect ratio
+#     :param head_direction       : direction of driver's gaze
+#     :param observation_complete : status of the driver observation
+#     :param ear_threshold        : eye aspect ratio threshold for determining driver status
+#     """
 
-    status = {
-        "timestamp": time.time(),
-        "driver_status": "ALERT" if eye_ar >= ear_threshold else "DROWSY",
-        "head_direction": head_direction,
-        "observation_complete": observation_complete
-    }
+#     status = {
+#         "timestamp": time.time(),
+#         "driver_status": "ALERT" if eye_ar >= ear_threshold else "DROWSY",
+#         "head_direction": head_direction,
+#         "observation_complete": observation_complete
+#     }
 
-    folder = "json_statuses"
-    if not os.path.exists(folder):
-        os.makedirs(folder)
+#     folder = "json_statuses"
+#     if not os.path.exists(folder):
+#         os.makedirs(folder)
 
-    status_path = os.path.join(folder, "video_status.json")
-    tmp_path    = os.path.join(folder, "video_status.json.tmp")
+#     status_path = os.path.join(folder, "video_status.json")
+#     tmp_path    = os.path.join(folder, "video_status.json.tmp")
 
-    with open(tmp_path, "w") as json_file:
-        json.dump(status, json_file, indent=4)
+#     with open(tmp_path, "w") as json_file:
+#         json.dump(status, json_file, indent=4)
 
-    retries = 5
+#     retries = 5
 
-    for x in range(retries):
-        try:
-            os.replace(tmp_path, status_path)
-            break
-        except PermissionError:
-            if x < retries - 1:
-                time.sleep(0.1)
-            else:
-                logging.warning("Status JSON is locked by another process. Skipping update.")
+#     for x in range(retries):
+#         try:
+#             os.replace(tmp_path, status_path)
+#             break
+#         except PermissionError:
+#             if x < retries - 1:
+#                 time.sleep(0.1)
+#             else:
+#                 logging.warning("Status JSON is locked by another process. Skipping update.")
 
 
 def setup_logger(log_level):
@@ -439,8 +443,10 @@ def main():
     logging.info("Starting VideoDetectionModule-RAS...")
     args = setup_argument_parser()
 
-    target_fps = args.target_fps
-    frame_duration = 1 / target_fps
+    # Keep daemon set to true to force API thread to run in background
+    api_thread = Thread(target=start_api, daemon=True)
+    api_thread.start()
+    logging.info(f"Starting API server at http://{HOST_NAME}:{PORT_NUMBER}/status...")
 
     setup_logger(args.log_level)
     video_logger = VideoLogger(active=args.log)
@@ -451,6 +457,9 @@ def main():
     if not video_stream.isOperational():
         logging.error("Camera failed to operate")
         exit()
+
+    target_fps = args.target_fps
+    frame_duration = 1 / target_fps
 
     video_width, video_height = video_stream.get_dimensions()
     detector, predictor       = setup_facial_recognition(args.dlib_model)
@@ -547,7 +556,8 @@ def main():
         if args.log:
             video_logger.record(eye_ar, head_direction, observation_complete)
 
-        update_json_status(eye_ar, head_direction, observation_complete, args.ear_threshold)
+        # update_json_status(eye_ar, head_direction, observation_complete, args.ear_threshold)
+        update_status(eye_ar, head_direction, observation_complete, args.ear_threshold)
 
         # Synchronize loop speed with target fps, providing software capped frame rate
         processing_time = time.time() - start_time
