@@ -228,7 +228,6 @@ def setup_argument_parser():
     parser.add_argument("-e",   "--ear_threshold",      help="Eye aspect ratio threshold for detecting drowsiness", default=EAR_THRESHOLD, type=float)
     parser.add_argument("-o",   "--observation_window", help="Observation safety window in seconds", default=OBSERVATION_SAFETY_WINDOW, type=float)
     parser.add_argument("-da",  "--disable_annotation", help="Disable annotation on video output", action="store_true")
-    parser.add_argument("-p",   "--plot",               help="Generate performance and metric plots on exit", action="store_true")
     parser.add_argument("-l",   "--log",                help="Enable csv logging", action="store_true")
 
     return parser.parse_args()
