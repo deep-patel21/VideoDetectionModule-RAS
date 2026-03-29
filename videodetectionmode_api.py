@@ -26,6 +26,15 @@ current_status = DriverStatus(
 )
 
 
+@app.get("/health")
+def health_check():
+    """
+    API endpoint for confirming availability health
+    """
+
+    return {"status": "ok"}
+
+
 @app.get("/status", response_model=DriverStatus)
 def get_videodetectionmodule_status():
     """
@@ -47,9 +56,16 @@ def update_status(eye_ar, head_direction, observation_complete, ear_threshold):
 
     global current_status
 
+    if head_direction == "LOST":
+        driver_status = "UNKNOWN"
+    elif eye_ar < ear_threshold:
+        driver_status = "DROWSY"
+    else:
+        driver_status = "ALERT"
+
     current_status = DriverStatus(
         timestamp            = time.time(),
-        driver_status        = "ALERT" if eye_ar >= ear_threshold else "DROWSY",
+        driver_status        = driver_status,
         head_direction       = head_direction,
         observation_complete = observation_complete,
     )
