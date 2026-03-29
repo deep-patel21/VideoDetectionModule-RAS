@@ -1,15 +1,17 @@
 import os
 import cv2
 import csv
-import dlib
 import time
 import logging
 import argparse
 import numpy as np
 
+from queue import Queue
 from threading import Thread
-from imutils import face_utils
-from scipy.spatial import distance
+
+import mediapipe as mp
+from mediapipe.tasks import python as mp_python
+from mediapipe.tasks.python import vision as mp_vision
 
 from videodetectionmode_api import start_api, update_status
 from videodetectionmode_api import HOST_NAME, PORT_NUMBER
@@ -21,18 +23,13 @@ try:
 except ImportError:
     PICAMERA_AVAILABLE = False
 
-LANDMARK_PREDICTION_MODEL = "models/shape_predictor_68_face_landmarks.dat"
-
-(LEFT_START, LEFT_END)   = face_utils.FACIAL_LANDMARKS_68_IDXS["left_eye"]
-(RIGHT_START, RIGHT_END) = face_utils.FACIAL_LANDMARKS_68_IDXS["right_eye"]
+LANDMARK_PREDICTION_MODEL = "models/face_landmarker.task"
 
 LOG_OPTIONS     = ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
-RISK_SEVERITIES = ["MILD", "MODERATE", "SEVERE"]
 
 CAMERA_INDEX              = 0
 TARGET_FPS                = 24
 DETECTION_SKIPPED_FRAMES  = 3
-CLAHE_SKIPPED_FRAMES      = 30
 EAR_THRESHOLD             = 0.17
 OBSERVATION_SAFETY_WINDOW = 5.0     # [seconds]
 OBSERVATION_LOST_TIMEOUT  = 0.8
@@ -40,15 +37,8 @@ OBSERVATION_LOST_TIMEOUT  = 0.8
 FRAME_WIDTH  = 640
 FRAME_HEIGHT = 480
 
-CLAHE_LIMIT_NO_BOOST    = 1.0
-CLAHE_LIMIT_LOW_BOOST   = 1.5
-CLAHE_LIMIT_MID_BOOST   = 2.0
-CLAHE_LIMIT_HIGH_BOOST  = 2.5
-CLAHE_LIMIT_ULTRA_BOOST = 3.0
-CLAHE_LIMIT_EXTRM_BOOST = 3.5
-CLAHE_LIMIT_MAX_BOOST   = 4.0
-
-DOWNSCALED_FRAME_WIDTH_PX = 320
+DOWNSCALED_FRAME_WIDTH_PX  = 320
+DOWNSCALED_FRAME_HEIGHT_PX = 240
 
 
 class CameraStream:
@@ -68,7 +58,7 @@ class CameraStream:
             self.setup_opencv_videocapture()
 
     def setup_opencv_videocapture(self):
-        self.cam = cv2.VideoCapture(CAMERA_INDEX)
+        self.cam = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_DSHOW)
 
     def setup_picamera(self):
         self.cam = Picamera2()
@@ -127,7 +117,6 @@ class VideoLogger:
         self.folder   = "csv_logs"
         self.filename = os.path.join(self.folder, f"video_log_{int(time.time())}.csv")
 
-        self.data   = []
         self.buffer = []
         self.buffer_size = buffer_size
 
@@ -160,6 +149,151 @@ class VideoLogger:
             self.buffer = []
 
 
+class LandmarkDetector:
+    """
+    A detection class to apply MediaPipe facial landmark detection and determine mesh eye and head poses
+    """
+
+    def __init__(self, landmarker_model):
+        self.downscale_width  = DOWNSCALED_FRAME_WIDTH_PX
+        self.downscale_height = DOWNSCALED_FRAME_HEIGHT_PX
+
+        # Head pose stability stores
+        self.direction_buffer = []
+        self.buffer_size = 5
+
+        # Overlay and recomputation stores
+        self.last_mesh   = None
+        self.last_result = None
+
+        # MediaPipeLandmarker configuration
+        base_options = mp_python.BaseOptions(
+            model_asset_path=landmarker_model
+        )
+
+        options = mp_vision.FaceLandmarkerOptions(
+            base_options=base_options,
+            num_faces=1,
+            min_face_detection_confidence=0.5,
+            min_tracking_confidence=0.5,
+            output_face_blendshapes=False,
+            output_facial_transformation_matrixes=False
+        )
+
+        self.landmarker = mp_vision.FaceLandmarker.create_from_options(options)
+
+    def compute_eye_aspect_ratio(self, p1, p2, p3, p4, p5, p6):
+        # Apply the eye aspect ratio formula on provided landmarks
+        v1 = np.linalg.norm(p2 - p6)
+        v2 = np.linalg.norm(p3 - p5)
+        v3 = np.linalg.norm(p1 - p4)
+
+        return (v1 + v2) / (2.0 * v3)
+
+    def eye_aspect_ratio_handler(self, mesh):
+        # Point transformation to convert normalized landmark to pixel coordinates
+        pt = lambda i: np.array([mesh[i].x, mesh[i].y])
+
+        # Determine eye-specific landmark points
+        left_eye_ar  = self.compute_eye_aspect_ratio(pt(33), pt(160), pt(158), pt(133), pt(153), pt(144))
+        right_eye_ar = self.compute_eye_aspect_ratio(pt(362), pt(385), pt(387), pt(263), pt(373), pt(380))
+
+        # Calculate the average eye aspect ratio to improve stability
+        averaged_ar = (left_eye_ar + right_eye_ar) / 2.0
+
+        return averaged_ar
+
+    def get_head_pose_ratios(self, mesh):
+        # Horizontal edge markers
+        nose_x     = mesh[1].x       # Nose tip
+        left_edge  = mesh[234].x     # Left face edge
+        right_edge = mesh[454].x     # Right face edge
+
+        # Vertical edge markers
+        nose_y        = mesh[1].y    # Nose tip
+        forehead_edge = mesh[10].y   # Top of forehead
+        chin_edge     = mesh[152].y  # Bottom of chin
+
+        face_width = right_edge - left_edge
+        face_height = chin_edge - forehead_edge
+
+        if face_width == 0 or face_height == 0:
+            return None
+
+        horizontal_ratio = (nose_x - left_edge)     / face_width
+        vertical_ratio   = (nose_y - forehead_edge) / face_height
+
+        return horizontal_ratio, vertical_ratio
+
+    def draw_overlay(self, display_frame):
+        if self.last_mesh is None:
+            return display_frame
+
+        display_frame_height, display_frame_width, _ = display_frame.shape
+
+        # Draw a box around the detected face
+        x_coordinates = [int(landmark.x * display_frame_width)  for landmark in self.last_mesh]
+        y_coordinates = [int(landmark.y * display_frame_height) for landmark in self.last_mesh]
+
+        x_left, x_right = min(x_coordinates), max(x_coordinates)
+        y_bottom, y_top = min(y_coordinates), max(y_coordinates)
+
+        cv2.rectangle(display_frame, (x_left, y_bottom), (x_right, y_top), (0, 255, 0), 2)
+
+        # Draw a face mask using the landmarks extracted with MediaPipe
+        for landmark in self.last_mesh:
+            landmark_x = int(landmark.x * display_frame_width)
+            landmark_y = int(landmark.y * display_frame_height)
+            cv2.circle(display_frame, (landmark_x, landmark_y), 1, (255, 255, 255), -1)
+
+        return display_frame
+
+    def process_frame(self, frame):
+        # Use the input frame as the input image for MediaPipe
+        image   = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame)
+        results = self.landmarker.detect(image)
+
+        eye_aspect_ratio = 0.0
+        if not results.face_landmarks:
+            return "LOST", eye_aspect_ratio
+
+        mesh = results.face_landmarks[0]
+        self.last_mesh = mesh
+
+        head_pose_ratios = self.get_head_pose_ratios(mesh)
+
+        if head_pose_ratios is None:
+            return "LOST", eye_aspect_ratio
+
+        horizontal_ratio, vertical_ratio = head_pose_ratios
+        eye_aspect_ratio = self.eye_aspect_ratio_handler(mesh)
+
+        logging.debug(f"H: {horizontal_ratio:.3f} | V: {vertical_ratio:.3f} | EYE: {eye_aspect_ratio:.3f}")
+
+        # Direction boundaries
+        if vertical_ratio > 0.60:
+            head_direction = "DOWN"
+        elif horizontal_ratio < 0.38:
+            head_direction = "LEFT"
+        elif horizontal_ratio > 0.62:
+            head_direction = "RIGHT"
+        else:
+            head_direction = "FORWARD"
+
+        # The direction buffer is used to stablize head direction before confirming a change
+        self.direction_buffer.append(head_direction)
+
+        if len(self.direction_buffer) > self.buffer_size:
+            self.direction_buffer.pop(0)
+
+        if self.direction_buffer.count(head_direction) == self.buffer_size:
+            confirmed_direction = head_direction
+        else:
+            confirmed_direction = self.direction_buffer[0]
+
+        return confirmed_direction, eye_aspect_ratio
+
+
 def setup_logger(log_level):
     """
     Setup logger with the specified log level.
@@ -186,7 +320,7 @@ def setup_argument_parser():
 
     parser.add_argument("-ll",  "--log_level",          help="Logging level to use with logging library", default="INFO", choices=LOG_OPTIONS)
     parser.add_argument("-fps", "--target_fps",         help="Target FPS for video processing", default=TARGET_FPS, type=int)
-    parser.add_argument("-m",   "--dlib_model",         help="Path to the Dlib landmark prediction model", default=LANDMARK_PREDICTION_MODEL, type=str)
+    parser.add_argument("-lm",  "--landmarker_model",   help="Path to MediaPipe face landmarker task model", default=LANDMARK_PREDICTION_MODEL)
     parser.add_argument("-s",   "--show_simple",        help="Show landmarks on a black canvas instead of raw video", action="store_true")
     parser.add_argument("-e",   "--ear_threshold",      help="Eye aspect ratio threshold for detecting drowsiness", default=EAR_THRESHOLD, type=float)
     parser.add_argument("-o",   "--observation_window", help="Observation safety window in seconds", default=OBSERVATION_SAFETY_WINDOW, type=float)
@@ -195,85 +329,6 @@ def setup_argument_parser():
     parser.add_argument("-l",   "--log",                help="Enable csv logging", action="store_true")
 
     return parser.parse_args()
-
-
-def setup_facial_recognition(dlib_model_path):
-    """
-    Return dlib facial detection and prediction instances
-
-    :param dlib_model_path: Path to the Dlib landmark prediction model
-    """
-
-    if not os.path.exists(dlib_model_path):
-        logging.error(f"Landmark prediction model not found at {dlib_model_path}")
-        exit()
-
-    # Use the Histogram of Oriented Gradients (HOG) detection from dlib
-    detector = dlib.get_frontal_face_detector()
-    predictor = dlib.shape_predictor(dlib_model_path)
-
-    return detector, predictor
-
-
-def compute_eye_aspect_ratio(eye):
-    """
-    Compute the eye aspect ratio using Euclidean distances.
-
-    :param eye: singular eye landmark set
-    """
-
-    v1 = distance.euclidean(eye[1], eye[5])
-    v2 = distance.euclidean(eye[2], eye[4])
-    v3 = distance.euclidean(eye[0], eye[3])
-
-    return (v1 + v2) / (2.0 * v3)
-
-
-def eye_aspect_ratio_handler(shape):
-    """
-    Compute the eye aspect ratio using Euclidean distances.
-
-    :param shape: facial landmarks extracted from the face
-    """
-
-    # Determine eye specific landmark points
-    left_eye  = shape[LEFT_START:LEFT_END]
-    right_eye = shape[RIGHT_START:RIGHT_END]
-
-    left_eye_ar  = compute_eye_aspect_ratio(left_eye)
-    right_eye_ar = compute_eye_aspect_ratio(right_eye)
-
-    # Calculate the average eye aspect ratio to improve stability
-    averaged_ar = (left_eye_ar + right_eye_ar) / 2.0
-
-    return averaged_ar
-
-
-def head_pose_handler(shape):
-    """
-    Compute the head pose direction based on facial landmarks.
-
-    :param shape: facial landmarks extracted from the face
-    """
-
-    # Identify key landmarks corresponding to face symmetry
-    nose_bridge = shape[27][0]
-    left_edge   = shape[0][0]
-    right_edge  = shape[16][0]
-
-    face_width = right_edge - left_edge
-
-    if face_width == 0:
-        return "FORWARD"
-
-    central_ratio = (nose_bridge - left_edge) / face_width
-
-    if central_ratio < 0.40:
-        return "LEFT"
-    elif central_ratio > 0.63:
-        return "RIGHT"
-    else:
-        return "FORWARD"
 
 
 def check_observation_status(head_direction, observation_status, window):
@@ -292,41 +347,13 @@ def check_observation_status(head_direction, observation_status, window):
     elif head_direction == "RIGHT":
         observation_status["right"] = current_time
 
-    left_look_completed = (current_time - observation_status["left"]) < window
+    left_look_completed  = (current_time - observation_status["left"]) < window
     right_look_completed = (current_time - observation_status["right"]) < window
 
     return (left_look_completed and right_look_completed)
 
 
-def get_adaptive_clahe_model(frame_greyscale):
-    """
-    Apply adaptive CLAHE (Contrast Limited Adaptive Histogram Equalization) to a greyscale frame.
-
-    :param frame_greyscale : frame captured in video stream converted to COLOR_BGR2GRAY
-    """
-
-    avg_brightness = np.mean(frame_greyscale)
-
-    if avg_brightness > 180:
-        clip_limit = CLAHE_LIMIT_NO_BOOST     # Well lit environment
-    elif avg_brightness > 150:
-        clip_limit = CLAHE_LIMIT_LOW_BOOST
-    elif avg_brightness > 120:
-        clip_limit = CLAHE_LIMIT_MID_BOOST    # Moderately lit environment
-    elif avg_brightness > 90:
-        clip_limit = CLAHE_LIMIT_HIGH_BOOST
-    elif avg_brightness > 60:
-        clip_limit = CLAHE_LIMIT_ULTRA_BOOST
-    elif avg_brightness > 40:
-        clip_limit = CLAHE_LIMIT_EXTRM_BOOST
-    else:
-        clip_limit = CLAHE_LIMIT_MAX_BOOST   # Dim environment
-
-    clahe_model = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=(8, 8))
-    return clahe_model, clip_limit
-
-
-def annotate_video(frame, video_width, video_height, video_type, fps, eye_ar, ear_threshold, head_direction, observation_complete, active_clip_limit):
+def annotate_video(frame, video_width, video_height, video_type, fps, eye_ar, ear_threshold, head_direction, observation_complete):
     """
     Annotate the video stream with resolution and frame rate information.
 
@@ -339,13 +366,12 @@ def annotate_video(frame, video_width, video_height, video_type, fps, eye_ar, ea
     :param ear_threshold        : eye aspect ratio threshold for determining driver status
     :param gaze_direction       : direction of driver's gaze
     :param observation_complete : status of the driver observation
-    :param active_clip_limit    : currently applied histogram equalization clip limit
     """
 
     # Blend overlay into original frame to achieve semi-transparent effect
     overlay = frame.copy()
 
-    panel_height = 135
+    panel_height = 100
     left_panel_width, right_panel_width = 240, 260
     alpha, beta = 0.7, 0.3
 
@@ -358,7 +384,6 @@ def annotate_video(frame, video_width, video_height, video_type, fps, eye_ar, ea
     fps_str        = f"FPS: {int(fps)}"
     eye_ar_str     = f"Eye Aspect Ratio: {eye_ar:.2f}"
     head_str       = f"Head Direction: {head_direction}"
-    clip_str       = f"CLAHE Clip Limit: {active_clip_limit}"
     video_type_str = f"Camera: {video_type}"
 
     # Styling Characteristics
@@ -388,7 +413,6 @@ def annotate_video(frame, video_width, video_height, video_type, fps, eye_ar, ea
     cv2.putText(frame, fps_str,        (10, 60),  font, scale, (200, 200, 200),  thickness, line_type)
     cv2.putText(frame, resolution_str, (10, 30),  font, scale, (200, 200, 200),  thickness, line_type)
     cv2.putText(frame, eye_ar_str,     (10, 90),  font, scale, (200, 200, 200),  thickness, line_type)
-    cv2.putText(frame, clip_str,       (10, 120), font, scale, (200, 200, 200),  thickness, line_type)
 
     # [RIGHT-ALIGNED] Driver status
     cv2.putText(frame, eye_status_str, (video_width - 175, 60),  font, scale, eye_status_color, thickness, line_type)
@@ -401,117 +425,79 @@ def annotate_video(frame, video_width, video_height, video_type, fps, eye_ar, ea
 
 def main():
     logging.info("Starting VideoDetectionModule-RAS...")
+
     args = setup_argument_parser()
-
-    # Keep daemon set to true to force API thread to run in background
-    api_thread = Thread(target=start_api, daemon=True)
-    api_thread.start()
-    logging.info(f"Starting API server at http://{HOST_NAME}:{PORT_NUMBER}/status...")
-
     setup_logger(args.log_level)
-    video_logger = VideoLogger(active=args.log)
+
+    # Initialize classes
     video_stream = CameraStream(index=CAMERA_INDEX)
-    video_type   = video_stream.get_camera_type()
+    video_logger = VideoLogger(active=args.log)
+    detector     = LandmarkDetector(landmarker_model=args.landmarker_model)
 
     # The program should not continue if the camera failed to initialize
     if not video_stream.isOperational():
         logging.error("Camera failed to operate")
         exit()
 
+    if not args.disable_api:
+        logging.info(f"Starting API server at http://{HOST_NAME}:{PORT_NUMBER}/status...")
+
+        # Keep daemon set to true to force API thread to run in background
+        api_server_thread = Thread(target=start_api,  daemon=True)
+        api_server_thread.start()
+
     target_fps = args.target_fps
-    frame_duration = 1 / target_fps
+    frame_duration = 1.0 / target_fps
 
     video_width, video_height = video_stream.get_dimensions()
-    detector, predictor       = setup_facial_recognition(args.dlib_model)
-
-    downscale_ratio  = video_width / DOWNSCALED_FRAME_WIDTH_PX
-    downscale_height = int(video_height / downscale_ratio)
+    video_type = video_stream.get_camera_type()
 
     # Observation maintenance variables
     last_known_head_direction = "FORWARD"
-    observation_status = {"left": 0, "right": 0}
-    observation_timestamp = time.time()
+    observation_status        = {"left": 0, "right": 0}
+    observation_timestamp     = time.time()
 
     # Detection optimization variables
-    frame_count      = 0
-    last_known_faces = []
-
-    # Contrast adjustment defaults
-    frame_default = np.zeros((downscale_height, DOWNSCALED_FRAME_WIDTH_PX), dtype=np.uint8)
-    clahe_model, active_clip_limit = get_adaptive_clahe_model(frame_default)
+    frame_count = 0
 
     while(True):
-        start_time = time.time()
+        start_time = time.perf_counter()
 
         # Continuously capture a frame with success/failure return value
         ret, raw_frame = video_stream.read()
 
-        if not ret:
-            logging.warning("Encountered frame drop. Exiting video stream.")
-            break
-
-        if raw_frame is None or raw_frame.size == 0:
-            logging.warning("Empty frame received. Skipping processing.")
+        if not ret or raw_frame is None or raw_frame.size == 0:
+            logging.warning("Frame capture failed, skipping frame...")
             continue
 
-        frame = cv2.flip(raw_frame, 1)
-        frame_downscaled = cv2.resize(frame, (DOWNSCALED_FRAME_WIDTH_PX, downscale_height))
+        frame_flipped    = cv2.flip(raw_frame, 1)
+        frame_downscaled = cv2.resize(frame_flipped, (DOWNSCALED_FRAME_WIDTH_PX, DOWNSCALED_FRAME_HEIGHT_PX))
+        frame            = cv2.cvtColor(frame_downscaled, cv2.COLOR_BGR2RGB)
 
-        # Tracking metrics are reset each iteration
-        eye_ar = 0
-        head_direction = "NONE"
-
-        # Detect facial landmarks on frame, applying histogram equalization periodically for improved detection
-        frame_greyscale = cv2.cvtColor(frame_downscaled, cv2.COLOR_BGR2GRAY)
-
-        if frame_count % CLAHE_SKIPPED_FRAMES == 0:
-            clahe_model, active_clip_limit = get_adaptive_clahe_model(frame_greyscale)
-
-        frame_greyscale = clahe_model.apply(frame_greyscale)
-
-        if args.show_simple:
-            display_frame = np.zeros((video_height, video_width, 3), dtype=np.uint8)
-        else:
-            frame_greyscale_upscaled = cv2.resize(frame_greyscale, (video_width, video_height))
-            display_frame = cv2.cvtColor(frame_greyscale_upscaled, cv2.COLOR_GRAY2BGR)
-
-        observation_complete = False
-
+        # Process a frame every DETECTION_SKIPPED_FRAMES, drawing cached overlay otherwise
         if frame_count % DETECTION_SKIPPED_FRAMES == 0:
-            # Keep the second parameter set to 0 for no scaling before detection
-            faces = detector(frame_greyscale, 0)
-            last_known_faces = faces
+            head_direction, eye_aspect_ratio = detector.process_frame(frame)
+            detector.last_result = (head_direction, eye_aspect_ratio)
         else:
-            # For skipped frames, reuse the previously detected face
-            faces = last_known_faces
+            if detector.last_result is not None:
+                head_direction, eye_aspect_ratio = detector.last_result
+            else:
+                head_direction, eye_aspect_ratio = "LOST", 0.0
 
-        if len(faces) > 0:
-            observation_timestamp = time.time()
-
-            for face in faces:
-                shape_downscaled = predictor(frame_greyscale, face)
-                shape_array      = face_utils.shape_to_np(shape_downscaled)
-                shape            = (shape_array * downscale_ratio).astype('int')
-
-                eye_ar = eye_aspect_ratio_handler(shape)
-                head_direction = head_pose_handler(shape)
-                last_known_head_direction = head_direction
-
-                # Draw a box around the detected face
-                x_left, x_right, y_top, y_bottom =  [int(v * downscale_ratio) for v in [face.left(), face.right(), face.top(), face.bottom()]]
-                cv2.rectangle(display_frame, (x_left, y_top), (x_right, y_bottom), (0, 255, 0), 2)
-
-                # Draw a face mask using the 68-landmarks extracted with dlib
-                for (x, y) in shape:
-                    cv2.circle(display_frame, (x, y), 1, (255, 255, 255), -1)
-
-                observation_complete = check_observation_status(head_direction, observation_status, args.observation_window)
-        else:
+        if head_direction == "LOST":
+            # Use the last known head direction within a short timeout to reduce noise between head pose transitions
             if (time.time() - observation_timestamp) < OBSERVATION_LOST_TIMEOUT:
                 head_direction = last_known_head_direction
-                observation_complete = check_observation_status(head_direction, observation_status, args.observation_window)
+                eye_ar = eye_aspect_ratio
             else:
-                head_direction = "LOST"
+                eye_ar = 0.0
+        else:
+            eye_ar = eye_aspect_ratio
+            last_known_head_direction = head_direction
+            observation_timestamp = time.time()
+            detector.last_result = (head_direction, eye_aspect_ratio)
+
+        observation_complete = check_observation_status(head_direction, observation_status, args.observation_window)
 
         if args.log:
             video_logger.record(eye_ar, head_direction, observation_complete)
@@ -520,20 +506,33 @@ def main():
             update_status(eye_ar, head_direction, observation_complete, args.ear_threshold)
 
         # Synchronize loop speed with target fps, providing software capped frame rate
-        processing_time = time.time() - start_time
+        processing_time = time.perf_counter() - start_time
 
-        if processing_time < frame_duration:
-            time.sleep(frame_duration - processing_time)
+        sleep_duration = frame_duration - processing_time
+        if sleep_duration > 0:
+            time.sleep(sleep_duration)
 
-        fps = 1.0 / (time.time() - start_time)
-        frame_count += 1
+        total_loop_time = time.perf_counter() - start_time
+
+        fps = 1.0 / total_loop_time
+
+        if args.show_simple:
+            output_frame = np.zeros((video_height, video_width, 3), dtype=np.uint8)
+        else:
+            output_frame = frame_flipped
+
+        detector.draw_overlay(output_frame)
 
         # Add text stating resolution and frames per second of video capture
         if not args.disable_annotation:
-            annotate_video(display_frame, video_width, video_height, video_type, fps, eye_ar, args.ear_threshold, head_direction,
-                           observation_complete, active_clip_limit)
+            annotate_video(output_frame, video_width, video_height, video_type, fps, eye_ar, args.ear_threshold, head_direction,
+                           observation_complete)
 
-        cv2.imshow('VideoDetectionModule - RAS', display_frame)
+        cv2.imshow('VideoDetectionModule - RAS', output_frame)
+
+        frame_count += 1
+        if frame_count % 100 == 0:
+            logging.info(f"Target: {target_fps} FPS | Actual: {fps:.2f} FPS | Processing Time: {total_loop_time:.4f}s")
 
         if cv2.waitKey(1) == ord('q'):
             break

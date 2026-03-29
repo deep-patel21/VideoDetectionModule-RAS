@@ -1,10 +1,6 @@
 # Cross-platform
 opencv-python
 numpy
-imutils
-scipy
-cmake
-dlib-bin
 pandas
 matplotlib
 fastapi
