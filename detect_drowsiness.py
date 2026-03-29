@@ -30,7 +30,8 @@ LOG_OPTIONS     = ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
 CAMERA_INDEX              = 0
 TARGET_FPS                = 24
 DETECTION_SKIPPED_FRAMES  = 3
-EAR_THRESHOLD             = 0.17
+DEFAULT_EAR_THRESHOLD     = 0.17
+CALIBRATION_DURATION      = 7.0     # [seconds]
 OBSERVATION_SAFETY_WINDOW = 5.0     # [seconds]
 OBSERVATION_LOST_TIMEOUT  = 0.8
 
@@ -126,14 +127,14 @@ class VideoLogger:
 
             with open(self.filename, "w", newline='') as log_file:
                 writer = csv.writer(log_file)
-                writer.writerow(["timestamp", "eye_ar", "head_direction", "observation_complete"])
+                writer.writerow(["timestamp", "eye_ar", "threshold", "head_direction", "observation_complete"])
 
-    def record(self, eye_ar, head_direction, observation_complete):
+    def record(self, eye_ar, threshold, head_direction, observation_complete):
         if self.active:
             timestamp = time.time()
 
             eye_ar_short = round(float(eye_ar), 3)
-            self.buffer.append([timestamp, eye_ar_short, head_direction, int(observation_complete)])
+            self.buffer.append([timestamp, eye_ar_short, threshold, head_direction, int(observation_complete)])
 
             # Flush the buffer when buffer_size is filled
             if len(self.buffer) >= self.buffer_size:
@@ -147,6 +148,57 @@ class VideoLogger:
 
             # Clear the buffer after write operation
             self.buffer = []
+
+
+class CalibrationManager:
+    """
+    A manager class to handle initial calibration process for eye aspect ratio threshold
+    """
+
+    def __init__ (self, duration):
+        self.start_time          = None
+        self.duration            = duration
+        self.threshold           = DEFAULT_EAR_THRESHOLD
+        self.is_calibration_done = False
+        self.data = []
+
+    def get_progress_string(self):
+        if self.is_calibration_done:
+            return "CALIBRATED"
+        
+        if self.start_time:
+            elapsed_time = time.perf_counter() - self.start_time
+        else:
+            elapsed_time = 0.0
+
+        progress_string = f"Calibrating EAR: {int(elapsed_time)}/{int(self.duration)}s"
+        return progress_string
+
+    def update_calibration(self, head_direction, eye_ar):
+        if self.is_calibration_done:
+            return True
+        
+        if self.start_time is None:
+            self.start_time = time.perf_counter()
+            logging.info(f"Calibration for eye threshold started. Duration target: {self.duration} seconds.")
+
+        calibration_time = time.perf_counter() - self.start_time
+
+        if head_direction != "LOST":
+            self.data.append(eye_ar)
+
+        if calibration_time >= self.duration:
+            if self.data:
+                average_eye_open_ar = np.mean(self.data)
+                
+                # Set the threshold to a percentage of the average eye open ratio
+                self.threshold = round(average_eye_open_ar * 0.70, 3)
+                logging.info(f"Calibration completed at threshold: {self.threshold:.3f} (Average Eye Open AR: {average_eye_open_ar:.3f})")
+            else:
+                logging.warning(f"Calibration failed without valid initialization data. Using default threshold at {self.threshold:.3f}")
+            self.is_calibration_done = True
+        
+        return self.is_calibration_done
 
 
 class LandmarkDetector:
@@ -318,15 +370,16 @@ def setup_argument_parser():
 
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("-ll",  "--log_level",          help="Logging level to use with logging library", default="INFO", choices=LOG_OPTIONS)
-    parser.add_argument("-fps", "--target_fps",         help="Target FPS for video processing", default=TARGET_FPS, type=int)
-    parser.add_argument("-lm",  "--landmarker_model",   help="Path to MediaPipe face landmarker task model", default=LANDMARK_PREDICTION_MODEL)
-    parser.add_argument("-s",   "--show_simple",        help="Show landmarks on a black canvas instead of raw video", action="store_true")
-    parser.add_argument("-e",   "--ear_threshold",      help="Eye aspect ratio threshold for detecting drowsiness", default=EAR_THRESHOLD, type=float)
-    parser.add_argument("-o",   "--observation_window", help="Observation safety window in seconds", default=OBSERVATION_SAFETY_WINDOW, type=float)
-    parser.add_argument("-da",  "--disable_annotation", help="Disable annotation on video output", action="store_true")
-    parser.add_argument("-DA",  "--disable_api",        help="Disable FastAPI integration", action="store_true")
-    parser.add_argument("-l",   "--log",                help="Enable csv logging", action="store_true")
+    parser.add_argument("-ll",  "--log_level",            help="Logging level to use with logging library", default="INFO", choices=LOG_OPTIONS)
+    parser.add_argument("-fps", "--target_fps",           help="Target FPS for video processing", default=TARGET_FPS, type=int)
+    parser.add_argument("-lm",  "--landmarker_model",     help="Path to MediaPipe face landmarker task model", default=LANDMARK_PREDICTION_MODEL)
+    parser.add_argument("-s",   "--show_simple",          help="Show landmarks on a black canvas instead of raw video", action="store_true")
+    parser.add_argument("-e",   "--ear_threshold",        help="Eye aspect ratio threshold for detecting drowsiness", default=DEFAULT_EAR_THRESHOLD, type=float)
+    parser.add_argument("-o",   "--observation_window",   help="Observation safety window in seconds", default=OBSERVATION_SAFETY_WINDOW, type=float)
+    parser.add_argument("-c",   "--calibration_duration", help="Target duration for eye threshold calibration process", default=CALIBRATION_DURATION, type=float)
+    parser.add_argument("-da",  "--disable_annotation",   help="Disable annotation on video output", action="store_true")
+    parser.add_argument("-DA",  "--disable_api",          help="Disable FastAPI integration", action="store_true")
+    parser.add_argument("-l",   "--log",                  help="Enable csv logging", action="store_true")
 
     return parser.parse_args()
 
@@ -432,6 +485,7 @@ def main():
     # Initialize classes
     video_stream = CameraStream(index=CAMERA_INDEX)
     video_logger = VideoLogger(active=args.log)
+    calibrator   = CalibrationManager(duration=args.calibration_duration)
     detector     = LandmarkDetector(landmarker_model=args.landmarker_model)
 
     # The program should not continue if the camera failed to initialize
@@ -456,6 +510,7 @@ def main():
     last_known_head_direction = "FORWARD"
     observation_status        = {"left": 0, "right": 0}
     observation_timestamp     = time.time()
+    current_ear_threshold     = args.ear_threshold
 
     # Detection optimization variables
     frame_count = 0
@@ -499,11 +554,8 @@ def main():
 
         observation_complete = check_observation_status(head_direction, observation_status, args.observation_window)
 
-        if args.log:
-            video_logger.record(eye_ar, head_direction, observation_complete)
-
         if not args.disable_api:
-            update_status(eye_ar, head_direction, observation_complete, args.ear_threshold)
+            update_status(eye_ar, head_direction, observation_complete, current_ear_threshold)
 
         # Synchronize loop speed with target fps, providing software capped frame rate
         processing_time = time.perf_counter() - start_time
@@ -523,10 +575,22 @@ def main():
 
         detector.draw_overlay(output_frame)
 
-        # Add text stating resolution and frames per second of video capture
+        # Perform eye aspect ratio threshold calibration
+        if not calibrator.is_calibration_done:
+            calibrator.update_calibration(head_direction, eye_aspect_ratio)
+            current_ear_threshold = calibrator.threshold
+
+            # Annotate calibration progress on flipped frame
+            cv2.putText(output_frame, calibrator.get_progress_string(), (10, 125), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1, cv2.LINE_AA)
+
+        # Add text stating system, driver, and video statistics
         if not args.disable_annotation:
-            annotate_video(output_frame, video_width, video_height, video_type, fps, eye_ar, args.ear_threshold, head_direction,
+            annotate_video(output_frame, video_width, video_height, video_type, fps, eye_ar, current_ear_threshold, head_direction,
                            observation_complete)
+
+        # Start recording video stream data logs
+        if args.log and calibrator.is_calibration_done:
+            video_logger.record(eye_ar, current_ear_threshold, head_direction, observation_complete)
 
         cv2.imshow('VideoDetectionModule - RAS', output_frame)
 
