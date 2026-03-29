@@ -453,7 +453,6 @@ def main():
     video_type = video_stream.get_camera_type()
 
     # Observation maintenance variables
-    processing_times          = []
     last_known_head_direction = "FORWARD"
     observation_status        = {"left": 0, "right": 0}
     observation_timestamp     = time.time()
