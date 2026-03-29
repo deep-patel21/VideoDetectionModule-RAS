@@ -9,13 +9,14 @@ Download the required python dependencies through pip:
 <details>
   <summary>Extra Installation Procedures</summary>
 
-  If the provided dlib 68-landmark predictor model is not working:
-  1. Navigate to https://dlib.net/files/.
-  2. Download ```"shape_predictor_68_face_landmarks.dat.bz2"```.
-  3. Decompress the file using ```bzip2 -d shape_predictor_68_face_landmarks.dat.bz2"```.
-  &emsp;3a. Windows users can alternatively use WinRAR for decompression.
-  4. Move the file into the directory ```VideoDetectionModule-RAS/models/```.
-  &emsp;4a. Models placed in other directories need to be referenced with the ```--dlib_model``` command line argument.
+  If the provided MediaPipe face landmarker is not working:
+  1. Try ```curl -o models/face_landmarker.task https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task```
+
+  Alternatively, 
+  1. Navigate to https://ai.google.dev/edge/mediapipe/solutions/vision/face_landmarker/index#models.
+  2. Download FaceLandmarker ```"latest"```, to obtain file: face_landmarker.task
+  3. Move the file into VideoDetectionModule-RAS/models/
+  &emsp;3a. Models placed in other directories need to be referenced with the ```--lm_model``` command line argument.
 </details>
 
 
@@ -26,32 +27,32 @@ The default visualization can be run with ```python3 detect_drowsiness.py```, bu
   <summary>Optional Flags</summary>
 
   ```
-  usage: detect_drowsiness.py [-h] [-ll {DEBUG,INFO,WARNING,ERROR,CRITICAL}] [-fps TARGET_FPS] [-m DLIB_MODEL] [-s] [-e EAR_THRESHOLD] [-o OBSERVATION_WINDOW]
-                              [-da] [-p] [-l]
+  usage: detect_drowsiness.py [-h] [-ll {DEBUG,INFO,WARNING,ERROR,CRITICAL}] [-fps TARGET_FPS] [-lm LANDMARKER_MODEL] [-s] [-e EAR_THRESHOLD]
+                            [-o OBSERVATION_WINDOW] [-da] [-DA] [-l]
 
   options:
-    -h, --help            show this help message and exit
-    -ll {DEBUG,INFO,WARNING,ERROR,CRITICAL}, --log_level {DEBUG,INFO,WARNING,ERROR,CRITICAL}
-                          Logging level to use with logging library
-    -fps TARGET_FPS, --target_fps TARGET_FPS
-                          Target FPS for video processing
-    -m DLIB_MODEL, --dlib_model DLIB_MODEL
-                          Path to the Dlib landmark prediction model
-    -s, --show_simple     Show landmarks on a black canvas instead of raw video
-    -e EAR_THRESHOLD, --ear_threshold EAR_THRESHOLD
-                          Eye aspect ratio threshold for detecting drowsiness
-    -o OBSERVATION_WINDOW, --observation_window OBSERVATION_WINDOW
-                          Observation safety window in seconds
-    -da, --disable_annotation
-                          Disable annotation on video output
-    -p, --plot            Generate performance and metric plots on exit
-    -l, --log             Enable csv logging
+  -h, --help            show this help message and exit
+  -ll {DEBUG,INFO,WARNING,ERROR,CRITICAL}, --log_level {DEBUG,INFO,WARNING,ERROR,CRITICAL}
+                        Logging level to use with logging library
+  -fps TARGET_FPS, --target_fps TARGET_FPS
+                        Target FPS for video processing
+  -lm LANDMARKER_MODEL, --landmarker_model LANDMARKER_MODEL
+                        Path to MediaPipe face landmarker task model
+  -s, --show_simple     Show landmarks on a black canvas instead of raw video
+  -e EAR_THRESHOLD, --ear_threshold EAR_THRESHOLD
+                        Eye aspect ratio threshold for detecting drowsiness
+  -o OBSERVATION_WINDOW, --observation_window OBSERVATION_WINDOW
+                        Observation safety window in seconds
+  -da, --disable_annotation
+                        Disable annotation on video output
+  -DA, --disable_api    Disable FastAPI integration
+  -l, --log             Enable csv logging
   ```
 </details>
 
 ### Visualizer Overview
 To show a simplified real-time view of what the module is doing, users can run ```python3 detect_drowsiness.py -s``` to see the facial landmark detection, along with system and driver statuses. The figure below showcases the simple operating mode, but users may run the script with optional flags to control the target ```--fps```, ```--ear_threshold``` which governs when eyes are reported "CLOSED", and ```--observation_window``` to analyze oncoming traffic from both directions.
-![visualizer_simple_mode](documentation_images/simple_mode.png)
+![visualizer_simple_mode](documentation_images/simple_mode_mediapipe.jpg)
 
 
 ### Logging Utilities
