@@ -3,6 +3,7 @@ opencv-python
 numpy
 pandas
 matplotlib
+mediapipe
 fastapi
 pydantic
 uvicorn
