@@ -4,6 +4,7 @@ import csv
 import time
 import logging
 import argparse
+import platform
 import numpy as np
 
 from queue import Queue
@@ -17,10 +18,13 @@ from videodetectionmode_api import start_api, update_status
 from videodetectionmode_api import HOST_NAME, PORT_NUMBER
 
 # Protection against dependency errors on non-linux platforms
-try:
-    from picamera2 import Picamera2
-    PICAMERA_AVAILABLE = True
-except ImportError:
+if os.name == "posix":
+    try:
+        from picamera2 import Picamera2
+        PICAMERA_AVAILABLE = True
+    except ImportError:
+        PICAMERA_AVAILABLE = False
+else:
     PICAMERA_AVAILABLE = False
 
 LANDMARK_PREDICTION_MODEL = "models/face_landmarker.task"
@@ -35,11 +39,14 @@ CALIBRATION_DURATION      = 7.0     # [seconds]
 OBSERVATION_SAFETY_WINDOW = 5.0     # [seconds]
 OBSERVATION_LOST_TIMEOUT  = 0.8
 
-FRAME_WIDTH  = 640
-FRAME_HEIGHT = 480
+YAW_TOLERANCE             = 22.0    # [degrees]
+PITCH_TOLERANCE           = 20.0    # [degrees]
 
-DOWNSCALED_FRAME_WIDTH_PX  = 320
-DOWNSCALED_FRAME_HEIGHT_PX = 240
+FRAME_WIDTH               = 640     # [pixels]
+FRAME_HEIGHT              = 480     # [pixels]
+
+DOWNSCALED_FRAME_WIDTH_PX  = 320    # [pixels]
+DOWNSCALED_FRAME_HEIGHT_PX = 240    # [pixels]
 
 
 class CameraStream:
@@ -59,7 +66,8 @@ class CameraStream:
             self.setup_opencv_videocapture()
 
     def setup_opencv_videocapture(self):
-        self.cam = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_DSHOW)
+        self.cam = cv2.VideoCapture(CAMERA_INDEX)
+        logging.info("OpenCV Video Capture initialized.")
 
     def setup_picamera(self):
         self.cam = Picamera2()
@@ -73,6 +81,9 @@ class CameraStream:
 
         self.cam.start()
         self.is_picamera = True
+
+        time.sleep(1.0)
+        logging.info("Picamera initialized.")
 
     def get_camera_type(self):
         if self.is_picamera:
@@ -88,7 +99,10 @@ class CameraStream:
 
     def read(self):
         if self.is_picamera:
-            return True, self.cam.capture_array()
+            frame = self.cam.capture_array()
+            
+            if frame is not None and frame.size > 0:
+                return True, frame
         else:
             return self.cam.read()
 
@@ -158,8 +172,20 @@ class CalibrationManager:
     def __init__ (self, duration):
         self.start_time          = None
         self.duration            = duration
-        self.threshold           = DEFAULT_EAR_THRESHOLD
         self.is_calibration_done = False
+
+        # eye parameters
+        self.threshold           = DEFAULT_EAR_THRESHOLD
+
+        # head parameters
+        self.yaw_base      = 0.0
+        self.pitch_base    = 0.0
+
+        self.yaw_samples   = []
+        self.pitch_samples = []
+
+        self.last_valid_yaw_delta = 0.0
+
         self.data = []
 
     def get_progress_string(self):
@@ -174,7 +200,29 @@ class CalibrationManager:
         progress_string = f"Calibrating EAR: {int(elapsed_time)}/{int(self.duration)}s"
         return progress_string
 
-    def update_calibration(self, head_direction, eye_ar):
+    def get_informed_direction(self, head_state, current_yaw, current_pitch, y_tol=YAW_TOLERANCE, p_tol=PITCH_TOLERANCE):
+        if not self.is_calibration_done:
+            return head_state
+
+        if head_state != "LOST":
+            yaw_delta = current_yaw - self.yaw_base
+            pitch_delta = current_pitch - self.pitch_base
+            self.last_valid_yaw_delta = yaw_delta
+
+            if yaw_delta < -y_tol:
+                return "LEFT"
+            elif yaw_delta > y_tol:
+                return "RIGHT"
+            elif pitch_delta > p_tol:
+                return "DOWN"
+            else:
+                return "FORWARD"
+        else:
+            if self.last_valid_yaw_delta < -18.0: 
+                return "LEFT"
+            return "LOST"
+
+    def update_calibration(self, head_direction, eye_ar, yaw=None, pitch=None):
         if self.is_calibration_done:
             return True
         
@@ -184,8 +232,15 @@ class CalibrationManager:
 
         calibration_time = time.perf_counter() - self.start_time
 
+        # update eye parameters
         if head_direction != "LOST":
             self.data.append(eye_ar)
+
+        # update head parameters
+        if yaw is not None:
+            self.yaw_samples.append(yaw)
+        if pitch is not None:
+            self.pitch_samples.append(pitch)
 
         if calibration_time >= self.duration:
             if self.data:
@@ -194,8 +249,13 @@ class CalibrationManager:
                 # Set the threshold to a percentage of the average eye open ratio
                 self.threshold = round(average_eye_open_ar * 0.70, 3)
                 logging.info(f"Calibration completed at threshold: {self.threshold:.3f} (Average Eye Open AR: {average_eye_open_ar:.3f})")
-            else:
-                logging.warning(f"Calibration failed without valid initialization data. Using default threshold at {self.threshold:.3f}")
+            if self.yaw_samples:
+                self.yaw_base = np.mean(self.yaw_samples)
+                logging.info(f"Calibration completed for yaw base: {self.yaw_base:.3f}")
+            if self.pitch_samples:
+                self.pitch_base = np.mean(self.pitch_samples)
+                logging.info(f"Calibration completed at pitch base: {self.pitch_base:.3f}")
+                
             self.is_calibration_done = True
         
         return self.is_calibration_done
@@ -229,7 +289,7 @@ class LandmarkDetector:
             min_face_detection_confidence=0.5,
             min_tracking_confidence=0.5,
             output_face_blendshapes=False,
-            output_facial_transformation_matrixes=False
+            output_facial_transformation_matrixes=True # Enabled to support head pose estimation
         )
 
         self.landmarker = mp_vision.FaceLandmarker.create_from_options(options)
@@ -276,6 +336,18 @@ class LandmarkDetector:
         vertical_ratio   = (nose_y - forehead_edge) / face_height
 
         return horizontal_ratio, vertical_ratio
+    
+    def get_head_euler_angles(self, result):
+        if not result.facial_transformation_matrixes:
+            return None
+    
+        mp_matrix  = result.facial_transformation_matrixes[0]
+        rtn_matrix = np.array(mp_matrix)[:3, :3]
+
+        pitch = np.degrees(np.arctan2(-rtn_matrix[1, 2], rtn_matrix[2, 2]))
+        yaw   = np.degrees(np.arctan2(rtn_matrix[0, 2],  np.sqrt(rtn_matrix[1, 2] ** 2) + rtn_matrix[2, 2] **2 ))
+
+        return yaw, pitch
 
     def draw_overlay(self, display_frame):
         if self.last_mesh is None:
@@ -307,44 +379,20 @@ class LandmarkDetector:
 
         eye_aspect_ratio = 0.0
         if not results.face_landmarks:
-            return "LOST", eye_aspect_ratio
+            return "LOST", eye_aspect_ratio, 0.0, 0.0
 
         mesh = results.face_landmarks[0]
         self.last_mesh = mesh
 
-        head_pose_ratios = self.get_head_pose_ratios(mesh)
+        euler = self.get_head_euler_angles(results)
+        if euler is None:
+            return "LOST", 0.0, 0.0, 0.0
 
-        if head_pose_ratios is None:
-            return "LOST", eye_aspect_ratio
-
-        horizontal_ratio, vertical_ratio = head_pose_ratios
+        current_yaw, current_pitch = euler
         eye_aspect_ratio = self.eye_aspect_ratio_handler(mesh)
 
-        logging.debug(f"H: {horizontal_ratio:.3f} | V: {vertical_ratio:.3f} | EYE: {eye_aspect_ratio:.3f}")
-
-        # Direction boundaries
-        if vertical_ratio > 0.60:
-            head_direction = "DOWN"
-        elif horizontal_ratio < 0.38:
-            head_direction = "LEFT"
-        elif horizontal_ratio > 0.62:
-            head_direction = "RIGHT"
-        else:
-            head_direction = "FORWARD"
-
-        # The direction buffer is used to stablize head direction before confirming a change
-        self.direction_buffer.append(head_direction)
-
-        if len(self.direction_buffer) > self.buffer_size:
-            self.direction_buffer.pop(0)
-
-        if self.direction_buffer.count(head_direction) == self.buffer_size:
-            confirmed_direction = head_direction
-        else:
-            confirmed_direction = self.direction_buffer[0]
-
-        return confirmed_direction, eye_aspect_ratio
-
+        return "CALIBRATING", eye_aspect_ratio, current_yaw, current_pitch
+    
 
 def setup_logger(log_level):
     """
@@ -529,11 +577,13 @@ def main():
         frame_downscaled = cv2.resize(frame_flipped, (DOWNSCALED_FRAME_WIDTH_PX, DOWNSCALED_FRAME_HEIGHT_PX))
         frame            = cv2.cvtColor(frame_downscaled, cv2.COLOR_BGR2RGB)
 
-        # Process a frame every DETECTION_SKIPPED_FRAMES, drawing cached overlay otherwise
         if frame_count % DETECTION_SKIPPED_FRAMES == 0:
-            head_direction, eye_aspect_ratio = detector.process_frame(frame)
+            # Use processed ratio and pose values to get predicted head direction
+            status, eye_aspect_ratio, raw_yaw, raw_pitch = detector.process_frame(frame)
+            head_direction = calibrator.get_informed_direction(status, raw_yaw, raw_pitch)
             detector.last_result = (head_direction, eye_aspect_ratio)
         else:
+            # Use stored ratio and pose values on non-detection frames
             if detector.last_result is not None:
                 head_direction, eye_aspect_ratio = detector.last_result
             else:
@@ -577,11 +627,11 @@ def main():
 
         # Perform eye aspect ratio threshold calibration
         if not calibrator.is_calibration_done:
-            calibrator.update_calibration(head_direction, eye_aspect_ratio)
+            calibrator.update_calibration(head_direction, eye_aspect_ratio, yaw=raw_yaw, pitch=raw_pitch)
             current_ear_threshold = calibrator.threshold
 
             # Annotate calibration progress on flipped frame
-            cv2.putText(output_frame, calibrator.get_progress_string(), (10, 125), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1, cv2.LINE_AA)
+            cv2.putText(output_frame, calibrator.get_progress_string(), (10, 125), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 128, 255), 1, cv2.LINE_AA)
 
         # Add text stating system, driver, and video statistics
         if not args.disable_annotation:
