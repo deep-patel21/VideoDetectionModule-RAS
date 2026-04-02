@@ -345,7 +345,7 @@ class LandmarkDetector:
         rtn_matrix = np.array(mp_matrix)[:3, :3]
 
         pitch = np.degrees(np.arctan2(-rtn_matrix[1, 2], rtn_matrix[2, 2]))
-        yaw   = np.degrees(np.arctan2(rtn_matrix[0, 2],  np.sqrt(rtn_matrix[1, 2] ** 2) + rtn_matrix[2, 2] **2 ))
+        yaw   = np.degrees(np.arctan2(rtn_matrix[0, 2],  np.sqrt(rtn_matrix[1, 2] ** 2 + rtn_matrix[2, 2] **2 )))
 
         return yaw, pitch
 
