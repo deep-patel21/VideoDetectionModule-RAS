@@ -2,12 +2,14 @@ import os
 import cv2
 import csv
 import time
+import shutil
 import logging
 import argparse
 import platform
+import subprocess
 import numpy as np
 
-from queue import Queue
+import threading
 from threading import Thread
 
 import mediapipe as mp
@@ -16,16 +18,6 @@ from mediapipe.tasks.python import vision as mp_vision
 
 from videodetectionmode_api import start_api, update_status
 from videodetectionmode_api import HOST_NAME, PORT_NUMBER
-
-# Protection against dependency errors on non-linux platforms
-if os.name == "posix":
-    try:
-        from picamera2 import Picamera2
-        PICAMERA_AVAILABLE = True
-    except ImportError:
-        PICAMERA_AVAILABLE = False
-else:
-    PICAMERA_AVAILABLE = False
 
 LANDMARK_PREDICTION_MODEL = "models/face_landmarker.task"
 
@@ -51,74 +43,111 @@ DOWNSCALED_FRAME_HEIGHT_PX = 240    # [pixels]
 
 class CameraStream:
     """
-    A wrapper class to select and operate a video stream based on available dependencies.
+    A handler class to select and operate a video stream based on avaiability
     """
 
     def __init__(self, index=CAMERA_INDEX):
+        self.cam         = None
+        self.process     = None
         self.is_picamera = False
-        self.cam = None
 
-        if PICAMERA_AVAILABLE:
-            logging.info("Video Capture Method: Picamera2")
-            self.setup_picamera()
+        # YUV420 pixel format
+        #     Frame size is width * height * 1.5 bytes due to chroma subsampling (4:2:0)
+        self._frame      = None
+        self.frame_size = FRAME_WIDTH * FRAME_HEIGHT * 3 // 2
+        
+        self._lock = threading.Lock()
+        self._running = False
+
+        # Check for available video capture methods
+        if platform.system() == "Linux" and shutil.which("rpicam-vid"):
+            self.setup_rpicam()
         else:
-            logging.info("Video Capture Method: OpenCV")
             self.setup_opencv_videocapture()
 
-    def setup_opencv_videocapture(self):
-        self.cam = cv2.VideoCapture(CAMERA_INDEX)
-        logging.info("OpenCV Video Capture initialized.")
-
-    def setup_picamera(self):
-        self.cam = Picamera2()
-
-        # Picamera configuration
-        picam_config = self.cam.create_preview_configuration(main={"size": (FRAME_WIDTH, FRAME_HEIGHT)})
-        self.cam.configure(picam_config)
-
-        # Picamera controls
-        self.cam.set_controls({"AfMode": 2})
-
-        self.cam.start()
-        self.is_picamera = True
-
-        time.sleep(1.0)
-        logging.info("Picamera initialized.")
+    def get_frame_dimensions(self):
+        return FRAME_WIDTH, FRAME_HEIGHT
 
     def get_camera_type(self):
         if self.is_picamera:
-            return "Picamera2"
+            return "rpicam-vid"
         else:
             return "OpenCV"
 
     def isOperational(self):
         if self.is_picamera:
-            return self.cam is not None
-        else:
-            return self.cam is not None and self.cam.isOpened()
+            return self._running and self.process.poll() is None
+        return self.cam is not None and self.cam.isOpened()
+
+    def setup_rpicam(self):
+        logging.info("Video Capture Method: rpicam-vid")
+
+        # Subprocess command to stream raw YUV420 frames from rpicam-vid
+        rpicam_cmd = [
+            "rpicam-vid",
+            "-t", "0",
+            "--width", str(FRAME_WIDTH),
+            "--height", str(FRAME_HEIGHT),
+            "--codec", "yuv420",
+            "--framerate", str(TARGET_FPS),
+            "--nopreview",
+            "-o", "-"
+        ]
+
+        self.process     = subprocess.Popen(rpicam_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        self.is_picamera = True
+        self._running    = True
+
+        # Read frames in dedicated thread
+        threading.Thread(target=self._reader_thread, daemon=True).start()
+        time.sleep(2.0)
+
+    def setup_opencv_videocapture(self):
+        logging.info("Video Capture Method: OpenCV")
+        self.cam = cv2.VideoCapture(CAMERA_INDEX)
 
     def read(self):
         if self.is_picamera:
-            frame = self.cam.capture_array()
+            with self._lock:
+                if self._frame is None:
+                    return False, None
+                
+                return True, self._frame.copy()
             
-            if frame is not None and frame.size > 0:
-                return True, frame
-        else:
-            return self.cam.read()
+        return self.cam.read()
 
+    def _reader_thread(self):
+        while self._running:
+            raw_frame = b""
+            remaining = self.frame_size
+
+            # Read bytes until a full YUV420 frame worth of data is read
+            while remaining > 0:
+                chunk = self.process.stdout.read(remaining)
+
+                if not chunk:
+                    self._running = False
+                    return
+                
+                # Assemble raw frame data from processed chunks
+                raw_frame += chunk
+                remaining -= len(chunk)
+
+            yuv   = np.frombuffer(raw_frame, dtype=np.uint8).reshape((FRAME_HEIGHT * 3 // 2, FRAME_WIDTH))
+            frame = cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR_I420)
+            
+            with self._lock:
+                self._frame = frame
+    
     def release(self):
-        if self.cam is not None:
-            if self.is_picamera:
-                self.cam.stop()
-            else:
-                self.cam.release()
+        self._running = False
 
-    def get_dimensions(self):
         if self.is_picamera:
-            return FRAME_WIDTH, FRAME_HEIGHT
+            if self.process:
+                self.process.terminate()
         else:
-            return (int(self.cam.get(cv2.CAP_PROP_FRAME_WIDTH)),
-                    int(self.cam.get(cv2.CAP_PROP_FRAME_HEIGHT)))
+            if self.cam:
+                self.cam.release()
 
 
 class VideoLogger:
@@ -551,7 +580,7 @@ def main():
     target_fps = args.target_fps
     frame_duration = 1.0 / target_fps
 
-    video_width, video_height = video_stream.get_dimensions()
+    video_width, video_height = video_stream.get_frame_dimensions()
     video_type = video_stream.get_camera_type()
 
     # Observation maintenance variables
@@ -563,97 +592,100 @@ def main():
     # Detection optimization variables
     frame_count = 0
 
-    while(True):
-        start_time = time.perf_counter()
+    try:
+        while(True):
+            start_time = time.perf_counter()
 
-        # Continuously capture a frame with success/failure return value
-        ret, raw_frame = video_stream.read()
+            # Continuously capture a frame with success/failure return value
+            ret, raw_frame = video_stream.read()
 
-        if not ret or raw_frame is None or raw_frame.size == 0:
-            logging.warning("Frame capture failed, skipping frame...")
-            continue
+            if not ret or raw_frame is None or raw_frame.size == 0:
+                logging.warning("Frame capture failed, skipping frame...")
+                continue
 
-        frame_flipped    = cv2.flip(raw_frame, 1)
-        frame_downscaled = cv2.resize(frame_flipped, (DOWNSCALED_FRAME_WIDTH_PX, DOWNSCALED_FRAME_HEIGHT_PX))
-        frame            = cv2.cvtColor(frame_downscaled, cv2.COLOR_BGR2RGB)
+            frame_flipped    = cv2.flip(raw_frame, 1)
+            frame_downscaled = cv2.resize(frame_flipped, (DOWNSCALED_FRAME_WIDTH_PX, DOWNSCALED_FRAME_HEIGHT_PX))
+            frame            = cv2.cvtColor(frame_downscaled, cv2.COLOR_BGR2RGB)
 
-        if frame_count % DETECTION_SKIPPED_FRAMES == 0:
-            # Use processed ratio and pose values to get predicted head direction
-            status, eye_aspect_ratio, raw_yaw, raw_pitch = detector.process_frame(frame)
-            head_direction = calibrator.get_informed_direction(status, raw_yaw, raw_pitch)
-            detector.last_result = (head_direction, eye_aspect_ratio)
-        else:
-            # Use stored ratio and pose values on non-detection frames
-            if detector.last_result is not None:
-                head_direction, eye_aspect_ratio = detector.last_result
+            if frame_count % DETECTION_SKIPPED_FRAMES == 0:
+                # Use processed ratio and pose values to get predicted head direction
+                status, eye_aspect_ratio, raw_yaw, raw_pitch = detector.process_frame(frame)
+                head_direction = calibrator.get_informed_direction(status, raw_yaw, raw_pitch)
+                detector.last_result = (head_direction, eye_aspect_ratio)
             else:
-                head_direction, eye_aspect_ratio = "LOST", 0.0
+                # Use stored ratio and pose values on non-detection frames
+                if detector.last_result is not None:
+                    head_direction, eye_aspect_ratio = detector.last_result
+                else:
+                    head_direction, eye_aspect_ratio = "LOST", 0.0
 
-        if head_direction == "LOST":
-            # Use the last known head direction within a short timeout to reduce noise between head pose transitions
-            if (time.time() - observation_timestamp) < OBSERVATION_LOST_TIMEOUT:
-                head_direction = last_known_head_direction
+            if head_direction == "LOST":
+                # Use the last known head direction within a short timeout to reduce noise between head pose transitions
+                if (time.time() - observation_timestamp) < OBSERVATION_LOST_TIMEOUT:
+                    head_direction = last_known_head_direction
+                    eye_ar = eye_aspect_ratio
+                else:
+                    eye_ar = 0.0
+            else:
                 eye_ar = eye_aspect_ratio
+                last_known_head_direction = head_direction
+                observation_timestamp = time.time()
+                detector.last_result = (head_direction, eye_aspect_ratio)
+
+            observation_complete = check_observation_status(head_direction, observation_status, args.observation_window)
+
+            if not args.disable_api:
+                update_status(eye_ar, head_direction, observation_complete, current_ear_threshold)
+
+            # Synchronize loop speed with target fps, providing software capped frame rate
+            processing_time = time.perf_counter() - start_time
+
+            sleep_duration = frame_duration - processing_time
+            if sleep_duration > 0:
+                time.sleep(sleep_duration)
+
+            total_loop_time = time.perf_counter() - start_time
+
+            fps = 1.0 / total_loop_time
+
+            if args.show_simple:
+                output_frame = np.zeros((video_height, video_width, 3), dtype=np.uint8)
             else:
-                eye_ar = 0.0
-        else:
-            eye_ar = eye_aspect_ratio
-            last_known_head_direction = head_direction
-            observation_timestamp = time.time()
-            detector.last_result = (head_direction, eye_aspect_ratio)
+                output_frame = frame_flipped
 
-        observation_complete = check_observation_status(head_direction, observation_status, args.observation_window)
+            detector.draw_overlay(output_frame)
 
-        if not args.disable_api:
-            update_status(eye_ar, head_direction, observation_complete, current_ear_threshold)
+            # Perform eye aspect ratio threshold calibration
+            if not calibrator.is_calibration_done:
+                calibrator.update_calibration(head_direction, eye_aspect_ratio, yaw=raw_yaw, pitch=raw_pitch)
+                current_ear_threshold = calibrator.threshold
 
-        # Synchronize loop speed with target fps, providing software capped frame rate
-        processing_time = time.perf_counter() - start_time
+                # Annotate calibration progress on flipped frame
+                cv2.putText(output_frame, calibrator.get_progress_string(), (10, 125), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 128, 255), 1, cv2.LINE_AA)
 
-        sleep_duration = frame_duration - processing_time
-        if sleep_duration > 0:
-            time.sleep(sleep_duration)
+            # Add text stating system, driver, and video statistics
+            if not args.disable_annotation:
+                annotate_video(output_frame, video_width, video_height, video_type, fps, eye_ar, current_ear_threshold, head_direction,
+                            observation_complete)
 
-        total_loop_time = time.perf_counter() - start_time
+            # Start recording video stream data logs
+            if args.log and calibrator.is_calibration_done:
+                video_logger.record(eye_ar, current_ear_threshold, head_direction, observation_complete)
 
-        fps = 1.0 / total_loop_time
+            cv2.imshow('VideoDetectionModule - RAS', output_frame)
 
-        if args.show_simple:
-            output_frame = np.zeros((video_height, video_width, 3), dtype=np.uint8)
-        else:
-            output_frame = frame_flipped
+            frame_count += 1
+            if frame_count % 100 == 0:
+                logging.info(f"Target: {target_fps} FPS | Actual: {fps:.2f} FPS | Processing Time: {total_loop_time:.4f}s")
 
-        detector.draw_overlay(output_frame)
-
-        # Perform eye aspect ratio threshold calibration
-        if not calibrator.is_calibration_done:
-            calibrator.update_calibration(head_direction, eye_aspect_ratio, yaw=raw_yaw, pitch=raw_pitch)
-            current_ear_threshold = calibrator.threshold
-
-            # Annotate calibration progress on flipped frame
-            cv2.putText(output_frame, calibrator.get_progress_string(), (10, 125), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 128, 255), 1, cv2.LINE_AA)
-
-        # Add text stating system, driver, and video statistics
-        if not args.disable_annotation:
-            annotate_video(output_frame, video_width, video_height, video_type, fps, eye_ar, current_ear_threshold, head_direction,
-                           observation_complete)
-
-        # Start recording video stream data logs
-        if args.log and calibrator.is_calibration_done:
-            video_logger.record(eye_ar, current_ear_threshold, head_direction, observation_complete)
-
-        cv2.imshow('VideoDetectionModule - RAS', output_frame)
-
-        frame_count += 1
-        if frame_count % 100 == 0:
-            logging.info(f"Target: {target_fps} FPS | Actual: {fps:.2f} FPS | Processing Time: {total_loop_time:.4f}s")
-
-        if cv2.waitKey(1) == ord('q'):
-            break
-
-    # Close the video stream and corresponding windows after usage
-    video_stream.release()
-    cv2.destroyAllWindows()
+            if cv2.waitKey(1) == ord('q'):
+                break
+    except KeyboardInterrupt:
+        logging.info("Exiting VideoDetectionModule-RAS...")
+    finally:
+        # Close the video stream and corresponding windows after usage
+        video_stream.release()
+        cv2.destroyAllWindows()
 
     if args.log:
         video_logger.flush_buffer()
@@ -662,3 +694,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
